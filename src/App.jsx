@@ -102,7 +102,12 @@ export default function App() {
 
   const log = (msg, type="info") => setApiLog(p => [{msg, type, ts: new Date().toLocaleTimeString("pt-BR")}, ...p].slice(0, 15));
 
+  // Ref sempre atualizado com os assets mais recentes — evita stale closure
+  const assetsRef = useRef(assets);
+  useEffect(() => { assetsRef.current = assets; }, [assets]);
+
   const atualizarTudo = useCallback(async () => {
+    const currentAssets = assetsRef.current; // sempre a lista mais atual
     setApiStatus({ cotacoes:"loading", cambio:"loading", indicadores:"loading" });
     log("Iniciando atualização...");
 
@@ -110,24 +115,30 @@ export default function App() {
     try {
       const r = await fetch(`${API}/api/cambio`);
       const d = await r.json();
-      if (d.usd_brl) { setUsdBrl(d.usd_brl); log(`Câmbio USD/BRL: R$ ${d.usd_brl.toFixed(4)}`, "ok"); }
-      setApiStatus(s => ({...s, cambio:"ok"}));
-    } catch(e) { log("Câmbio: erro", "error"); setApiStatus(s => ({...s, cambio:"error"})); }
+      if (d.usd_brl) {
+        setUsdBrl(d.usd_brl);
+        log(`Câmbio USD/BRL: R$ ${d.usd_brl.toFixed(4)} (${d.fonte})`, "ok");
+        setApiStatus(s => ({...s, cambio:"ok"}));
+      } else {
+        log("Câmbio: sem dado disponível, mantendo último valor", "warn");
+        setApiStatus(s => ({...s, cambio:"warn"}));
+      }
+    } catch(e) { log("Câmbio: erro de conexão", "error"); setApiStatus(s => ({...s, cambio:"error"})); }
 
     // Indicadores
     try {
       const r = await fetch(`${API}/api/indicadores`);
       const d = await r.json();
       setIndicadores(d);
-      log(`CDI ${d.cdi_anual}% · Selic ${d.selic}% · IPCA ${d.ipca_mensal}%/mês`, "ok");
+      log(`CDI ${d.cdi_anual}% a.a. · Selic ${d.selic}% · IPCA ${d.ipca_mensal}%/mês`, "ok");
       setApiStatus(s => ({...s, indicadores:"ok"}));
     } catch(e) { log("Indicadores: erro", "error"); setApiStatus(s => ({...s, indicadores:"error"})); }
 
-    // B3
-    const b3 = assets.filter(a => ["Ações B3","FIIs B3"].includes(a.classe));
+    // B3 — usa currentAssets para pegar ativos recém-lançados
+    const b3 = currentAssets.filter(a => ["Ações B3","FIIs B3"].includes(a.classe));
     if (b3.length > 0) {
       try {
-        const tickers = b3.map(a => a.ticker).join(",");
+        const tickers = [...new Set(b3.map(a => a.ticker))].join(",");
         const r = await fetch(`${API}/api/cotacoes/b3?tickers=${tickers}`);
         const d = await r.json();
         if (d.cotacoes) {
@@ -137,11 +148,11 @@ export default function App() {
       } catch(e) { log("B3: erro ao buscar cotações", "error"); }
     }
 
-    // EUA
-    const eua = assets.filter(a => ["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
+    // EUA — idem
+    const eua = currentAssets.filter(a => ["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
     if (eua.length > 0) {
       try {
-        const tickers = eua.map(a => a.ticker).join(",");
+        const tickers = [...new Set(eua.map(a => a.ticker))].join(",");
         const r = await fetch(`${API}/api/cotacoes/eua?tickers=${tickers}`);
         const d = await r.json();
         if (d.cotacoes) {
@@ -165,7 +176,7 @@ export default function App() {
     const now = new Date().toLocaleString("pt-BR");
     setLastUpdate(now);
     log(`Concluído — ${now}`, "ok");
-  }, [assets]);
+  }, []); // sem dependência em assets — usa assetsRef
 
   useEffect(() => { atualizarTudo(); }, []);
 
@@ -185,15 +196,28 @@ export default function App() {
     if (!form.ticker || !form.qtd || !form.preco) return;
     setSaving(true);
     setTimeout(() => {
+      const ticker = form.ticker.toUpperCase();
+      let isNew = false;
       if (form.tipo === "compra") {
-        const ex = assets.find(a => a.ticker===form.ticker && a.investidor===form.investidor);
-        if (ex) { const nq=ex.qtd+parseFloat(form.qtd); const nm=(ex.qtd*ex.preco_medio+parseFloat(form.qtd)*parseFloat(form.preco))/nq; setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:nq,preco_medio:nm}:a)); }
-        else { setAssets(p=>[...p,{id:Date.now(),ticker:form.ticker.toUpperCase(),nome:form.nome||form.ticker.toUpperCase(),classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco_medio:parseFloat(form.preco),preco_atual:parseFloat(form.preco),moeda:form.moeda,proventos:0}]); }
+        const ex = assetsRef.current.find(a => a.ticker===ticker && a.investidor===form.investidor);
+        if (ex) {
+          const nq = ex.qtd + parseFloat(form.qtd);
+          const nm = (ex.qtd*ex.preco_medio + parseFloat(form.qtd)*parseFloat(form.preco)) / nq;
+          setAssets(p => p.map(a => a.id===ex.id ? {...a, qtd:nq, preco_medio:nm} : a));
+        } else {
+          isNew = true;
+          setAssets(p => [...p, {id:Date.now(), ticker, nome:form.nome||ticker, classe:form.classe, investidor:form.investidor, qtd:parseFloat(form.qtd), preco_medio:parseFloat(form.preco), preco_atual:parseFloat(form.preco), moeda:form.moeda, proventos:0}]);
+        }
       } else {
-        setAssets(p=>p.map(a=>{if(a.ticker===form.ticker&&a.investidor===form.investidor){const nq=a.qtd-parseFloat(form.qtd);return nq<=0?null:{...a,qtd:nq};}return a;}).filter(Boolean));
+        setAssets(p => p.map(a => {
+          if (a.ticker===ticker && a.investidor===form.investidor) { const nq=a.qtd-parseFloat(form.qtd); return nq<=0?null:{...a,qtd:nq}; }
+          return a;
+        }).filter(Boolean));
       }
       setSaving(false);
       setForm(f => ({...f, ticker:"", nome:"", qtd:"", preco:""}));
+      // Se ativo novo, busca cotação atual após um tick (state já atualizado via ref)
+      if (isNew) setTimeout(() => atualizarTudo(), 100);
     }, 500);
   }
 
