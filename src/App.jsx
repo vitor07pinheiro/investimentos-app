@@ -229,6 +229,8 @@ function AppInner({ onLogout }){
   const [saving,setSaving]=useState(false);
   const [apiLog,setApiLog]=useState([]);
   const [opFiltro,setOpFiltro]=useState({investidor:"Todos",tipo:"Todos",ticker:""});
+  const [editOp,setEditOp]=useState(null); // operação sendo editada
+  const [confirmDelete,setConfirmDelete]=useState(null); // id da operação a excluir
 
   const dashChartRef=useRef(null);const dashChartInst=useRef(null);
   const chartRef=useRef(null);const chartInst=useRef(null);
@@ -335,6 +337,75 @@ function AppInner({ onLogout }){
   const totalRent=totalCusto>0?(totalPatrim-totalCusto)/totalCusto*100:0;
   const totalProv=filtP.reduce((s,p)=>s+(p.moeda==="USD"?p.valor*usdBrl:p.valor),0);
   const byClass=useMemo(()=>{const m={};filtA.forEach(a=>{if(!m[a.classe])m[a.classe]=0;m[a.classe]+=toVal(a,usdBrl,indicadores);});return Object.entries(m).sort((x,y)=>y[1]-x[1]);},[filtA,usdBrl,indicadores]);
+
+  // ── Reconstrói a carteira a partir da lista de operações (usado após edição/exclusão) ──
+  function reconstruirCarteira(ops, ativosAtuais) {
+    // Preserva preco_atual, variacao_dia, proventos e dados de RF dos ativos existentes
+    const cache = {};
+    ativosAtuais.forEach(a => { cache[`${a.ticker}_${a.investidor}`] = a; });
+
+    // Ordena por data crescente para processar na ordem cronológica
+    const ordenadas = [...ops].sort((a,b)=>a.data.localeCompare(b.data));
+    const posicoes = {}; // { "TICKER_INV": { qtd, preco_medio, lucroRealizado, ... } }
+    const zerados = {};
+
+    ordenadas.forEach(op => {
+      const k = `${op.ticker}_${op.investidor}`;
+      const prev = posicoes[k] || {
+        ticker: op.ticker, nome: op.nome || op.ticker, classe: op.classe, investidor: op.investidor,
+        qtd: 0, preco_medio: 0, moeda: op.moeda, lucroRealizado: 0, proventos: cache[k]?.proventos||0,
+        data_compra: op.data, preco_atual: cache[k]?.preco_atual || op.preco, variacao_dia: cache[k]?.variacao_dia,
+        indexador: cache[k]?.indexador, taxa: cache[k]?.taxa, modo_cdi: cache[k]?.modo_cdi, vencimento: cache[k]?.vencimento,
+        id: cache[k]?.id || Date.now()+Math.random(),
+      };
+      if (op.tipo === "compra") {
+        const novaQtd = prev.qtd + op.qtd;
+        const novoMed = novaQtd>0 ? (prev.qtd*prev.preco_medio + op.qtd*op.preco)/novaQtd : op.preco;
+        posicoes[k] = {...prev, qtd:novaQtd, preco_medio:novoMed};
+      } else {
+        const lucro = (op.preco - prev.preco_medio) * op.qtd * (op.moeda==="USD" ? usdBrl : 1);
+        const novaQtd = prev.qtd - op.qtd;
+        if (novaQtd <= 0.0001) {
+          // posição zerada
+          zerados[k] = {
+            ticker:prev.ticker, nome:prev.nome, classe:prev.classe, investidor:prev.investidor,
+            preco_medio: prev.preco_medio,
+            lucroRealizado: (zerados[k]?.lucroRealizado || 0) + prev.lucroRealizado + lucro,
+            vendas: [...(zerados[k]?.vendas || []), {data:op.data, qtd:op.qtd, preco:op.preco, lucro}],
+          };
+          delete posicoes[k];
+        } else {
+          posicoes[k] = {...prev, qtd:novaQtd, lucroRealizado:prev.lucroRealizado + lucro};
+        }
+      }
+    });
+
+    return { ativos: Object.values(posicoes), zerados };
+  }
+
+  function aplicarReconstrucao(novasOps) {
+    setOperacoes(novasOps);
+    const {ativos, zerados} = reconstruirCarteira(novasOps, assetsRef.current);
+    setAssets(ativos);
+    setAtivosZerados(zerados);
+  }
+
+  function excluirOperacao(id) {
+    const novasOps = operacoes.filter(o => o.id !== id);
+    aplicarReconstrucao(novasOps);
+    setConfirmDelete(null);
+  }
+
+  function salvarEdicao(opEditada) {
+    const novasOps = operacoes.map(o => o.id === opEditada.id ? {
+      ...opEditada,
+      qtd: parseFloat(opEditada.qtd),
+      preco: parseFloat(opEditada.preco),
+      total: parseFloat(opEditada.qtd) * parseFloat(opEditada.preco) * (opEditada.moeda==="USD" ? usdBrl : 1),
+    } : o);
+    aplicarReconstrucao(novasOps);
+    setEditOp(null);
+  }
 
   // ── Operações filtradas ─────────────────────────────────────────────────────
   const filtOps=useMemo(()=>{
@@ -832,7 +903,7 @@ function AppInner({ onLogout }){
               ?<div style={{...glass,textAlign:"center",padding:"2rem"}}><i className="ti ti-history" style={{fontSize:32,color:"rgba(255,255,255,0.3)"}}/><p style={{color:"rgba(255,255,255,0.4)",margin:"8px 0 0",fontSize:13}}>Nenhuma operação registrada ainda.</p></div>
               :<div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Data","Tipo","Ticker","Investidor","Classe","Qtd","Preço","Total (R$)"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
+                  <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Data","Tipo","Ticker","Investidor","Classe","Qtd","Preço","Total (R$)","Ações"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
                   <tbody>
                     {filtOps.map((op,i)=>(
                       <tr key={op.id} style={{borderTop:"1px solid rgba(255,255,255,0.06)",background:i%2===0?"rgba(255,255,255,0.02)":"transparent"}}>
@@ -844,12 +915,86 @@ function AppInner({ onLogout }){
                         <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{fmt(op.qtd,op.qtd<1?6:2)}</td>
                         <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{op.moeda==="USD"?fmtUSD(op.preco):fmtBRL(op.preco)}</td>
                         <td style={{padding:"8px 10px",fontWeight:500,color:op.tipo==="compra"?"#86efac":"#fca5a5"}}>{fmtBRL(op.total)}</td>
+                        <td style={{padding:"8px 10px",whiteSpace:"nowrap"}}>
+                          <button onClick={()=>setEditOp({...op})} title="Editar" style={{padding:"3px 7px",fontSize:11,borderRadius:6,border:"1px solid rgba(96,165,250,0.3)",background:"rgba(96,165,250,0.15)",color:"#93c5fd",cursor:"pointer",marginRight:4}}>
+                            <i className="ti ti-pencil" style={{fontSize:11}}/>
+                          </button>
+                          <button onClick={()=>setConfirmDelete(op.id)} title="Excluir" style={{padding:"3px 7px",fontSize:11,borderRadius:6,border:"1px solid rgba(248,113,113,0.3)",background:"rgba(248,113,113,0.15)",color:"#fca5a5",cursor:"pointer"}}>
+                            <i className="ti ti-trash" style={{fontSize:11}}/>
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             }
+
+            {/* Modal de edição */}
+            {editOp&&(
+              <div onClick={()=>setEditOp(null)} style={{position:"fixed",inset:0,background:"rgba(0,10,30,0.7)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:"1rem"}}>
+                <div onClick={e=>e.stopPropagation()} style={{background:"linear-gradient(160deg,#1a3a7c,#2563a8)",border:"1px solid rgba(255,255,255,0.15)",borderRadius:16,padding:"1.5rem",width:"100%",maxWidth:480}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                    <p style={{fontWeight:500,fontSize:15,margin:0,color:"#fff"}}>
+                      <i className="ti ti-pencil" style={{fontSize:14,marginRight:6,color:"#93c5fd"}}/>Editar operação
+                    </p>
+                    <button onClick={()=>setEditOp(null)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.5)",cursor:"pointer",padding:4}}>
+                      <i className="ti ti-x" style={{fontSize:18}}/>
+                    </button>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                    {[
+                      {l:"Tipo",e:<select value={editOp.tipo} onChange={e=>setEditOp({...editOp,tipo:e.target.value})}><option value="compra">Compra</option><option value="venda">Venda</option></select>},
+                      {l:"Investidor",e:<select value={editOp.investidor} onChange={e=>setEditOp({...editOp,investidor:e.target.value})}><option>Vitor</option><option>Larissa</option></select>},
+                      {l:"Ticker",e:<input value={editOp.ticker} onChange={e=>setEditOp({...editOp,ticker:e.target.value.toUpperCase()})}/>},
+                      {l:"Classe",e:<select value={editOp.classe} onChange={e=>setEditOp({...editOp,classe:e.target.value})}>{CLASSES.map(c=><option key={c}>{c}</option>)}</select>},
+                      {l:"Quantidade",e:<input type="number" value={editOp.qtd} onChange={e=>setEditOp({...editOp,qtd:e.target.value})}/>},
+                      {l:"Preço unit.",e:<input type="number" value={editOp.preco} onChange={e=>setEditOp({...editOp,preco:e.target.value})}/>},
+                      {l:"Data",e:<input type="date" value={editOp.data} onChange={e=>setEditOp({...editOp,data:e.target.value})}/>},
+                      {l:"Moeda",e:<select value={editOp.moeda} onChange={e=>setEditOp({...editOp,moeda:e.target.value})}><option value="BRL">BRL (R$)</option><option value="USD">USD (US$)</option></select>},
+                    ].map(({l,e})=>(<div key={l}><label style={{fontSize:12,color:"rgba(255,255,255,0.6)",display:"block",marginBottom:4}}>{l}</label>{e}</div>))}
+                  </div>
+                  <div style={{display:"flex",gap:8,marginTop:18}}>
+                    <button onClick={()=>setEditOp(null)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.7)",cursor:"pointer"}}>Cancelar</button>
+                    <button onClick={()=>salvarEdicao(editOp)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"none",background:"rgba(96,165,250,0.5)",color:"#fff",cursor:"pointer"}}>
+                      <i className="ti ti-check" style={{fontSize:13,marginRight:4}}/>Salvar
+                    </button>
+                  </div>
+                  <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"12px 0 0",textAlign:"center"}}>
+                    <i className="ti ti-info-circle" style={{fontSize:11,marginRight:3}}/>A carteira será recalculada automaticamente
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Modal de confirmação de exclusão */}
+            {confirmDelete!==null&&(()=>{
+              const op=operacoes.find(o=>o.id===confirmDelete);
+              if(!op)return null;
+              return(
+                <div onClick={()=>setConfirmDelete(null)} style={{position:"fixed",inset:0,background:"rgba(0,10,30,0.7)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:"1rem"}}>
+                  <div onClick={e=>e.stopPropagation()} style={{background:"linear-gradient(160deg,#1a3a7c,#2563a8)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:16,padding:"1.5rem",width:"100%",maxWidth:380,textAlign:"center"}}>
+                    <div style={{width:48,height:48,borderRadius:"50%",background:"rgba(248,113,113,0.2)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px"}}>
+                      <i className="ti ti-trash" style={{fontSize:22,color:"#fca5a5"}}/>
+                    </div>
+                    <p style={{fontWeight:500,fontSize:15,margin:"0 0 8px",color:"#fff"}}>Excluir operação?</p>
+                    <p style={{fontSize:12,color:"rgba(255,255,255,0.6)",margin:"0 0 4px"}}>
+                      <span style={tipoBadge(op.tipo)}>{op.tipo}</span> · <strong>{op.ticker}</strong> · {fmt(op.qtd,op.qtd<1?6:2)} unid. a {op.moeda==="USD"?fmtUSD(op.preco):fmtBRL(op.preco)}
+                    </p>
+                    <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"0 0 16px"}}>{op.data} · {op.investidor}</p>
+                    <p style={{fontSize:11,color:"#fde68a",margin:"0 0 16px",padding:"8px",borderRadius:6,background:"rgba(251,191,36,0.1)",border:"1px solid rgba(251,191,36,0.2)"}}>
+                      <i className="ti ti-alert-triangle" style={{fontSize:11,marginRight:4}}/>A carteira será recalculada e o lucro realizado pode mudar.
+                    </p>
+                    <div style={{display:"flex",gap:8}}>
+                      <button onClick={()=>setConfirmDelete(null)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.7)",cursor:"pointer"}}>Cancelar</button>
+                      <button onClick={()=>excluirOperacao(confirmDelete)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"none",background:"rgba(248,113,113,0.5)",color:"#fff",cursor:"pointer"}}>
+                        <i className="ti ti-trash" style={{fontSize:13,marginRight:4}}/>Excluir
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
