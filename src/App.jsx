@@ -109,8 +109,29 @@ const fmt = (v,d=2) => isNaN(v)?"—":v.toLocaleString("pt-BR",{minimumFractionD
 const fmtBRL = v => "R$ "+fmt(v);
 const fmtUSD = v => "US$ "+fmt(v);
 const fmtPct = v => (v>=0?"+":"")+fmt(v,2)+"%";
-const mesAtual = () => { const d=new Date(); return `${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`; };
-const mesLabel = () => { const d=new Date(); const ms=["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]; return `${ms[d.getMonth()]}/${String(d.getFullYear()).slice(2)}`; };
+
+// Chave do mês corrente no formato "MM/YYYY"
+const mesAtualKey = () => { const d=new Date(); return `${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`; };
+// Label "Jan/26" a partir de "01/2026"
+const keyToLabel = (key) => {
+  const [m,y]=key.split("/");
+  const ms=["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"];
+  return `${ms[parseInt(m)-1]}/${String(y).slice(2)}`;
+};
+// Ordena chaves "MM/YYYY" cronologicamente
+const sortKeys = (a,b) => {
+  const [ma,ya]=a.split("/"),[mb,yb]=b.split("/");
+  return ya===yb?parseInt(ma)-parseInt(mb):parseInt(ya)-parseInt(yb);
+};
+// Gera lista de chaves dos últimos N meses até o mês atual
+const ultimosMeses = (n) => {
+  const arr=[];const d=new Date();
+  for(let i=n-1;i>=0;i--){
+    const x=new Date(d.getFullYear(),d.getMonth()-i,1);
+    arr.push(`${String(x.getMonth()+1).padStart(2,"0")}/${x.getFullYear()}`);
+  }
+  return arr;
+};
 
 function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
 function saveState(s){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch(e){}}
@@ -180,52 +201,80 @@ function AppInner({ onLogout }){
   const dashChartRef=useRef(null);const dashChartInst=useRef(null);
   const chartRef=useRef(null);const chartInst=useRef(null);
   const pieRef=useRef(null);const pieInst=useRef(null);
+  const lucroChartRef=useRef(null);const lucroChartInst=useRef(null);
   const assetsRef=useRef(assets);
   useEffect(()=>{assetsRef.current=assets;},[assets]);
 
   // ── Salvar estado ───────────────────────────────────────────────────────────
   useEffect(()=>{saveState({assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass});},[assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass]);
 
-  // ── Snapshot mensal: atualiza o mês corrente sempre que ativos ou câmbio mudam ──
+  // ── Snapshot mensal dinâmico: atualiza o mês vigente sempre que ativos ou câmbio mudam ──
+  // Snapshots de meses anteriores ficam imutáveis (criados quando o mês fecha ou via carga histórica)
   useEffect(()=>{
-    if(assets.length===0)return;
-    const mes=mesAtual();
+    const mes=mesAtualKey();
     const vitor=assets.filter(a=>a.investidor==="Vitor").reduce((s,a)=>s+toVal(a,usdBrl),0);
     const larissa=assets.filter(a=>a.investidor==="Larissa").reduce((s,a)=>s+toVal(a,usdBrl),0);
     setSnapshots(prev=>{
       const cur=prev[mes];
       if(cur&&Math.abs(cur.vitor-vitor)<0.01&&Math.abs(cur.larissa-larissa)<0.01)return prev;
-      return {...prev,[mes]:{vitor,larissa}};
+      return {...prev,[mes]:{vitor,larissa,atualizado:new Date().toISOString()}};
     });
   },[assets,usdBrl]);
 
-  // ── Histórico para gráficos: mescla snapshots salvos com meses anteriores fixos ──
-  const histData=useMemo(()=>{
-    // meses base (anteriores ao mês atual, estimados ou reais salvos)
-    const base=[
-      {mes:"Jul/25",vitor:78000,larissa:58000},{mes:"Ago/25",vitor:80500,larissa:60000},
-      {mes:"Set/25",vitor:82000,larissa:61500},{mes:"Out/25",vitor:85000,larissa:63000},
-      {mes:"Nov/25",vitor:87500,larissa:65000},{mes:"Dez/25",vitor:91000,larissa:68000},
-      {mes:"Jan/26",vitor:95000,larissa:73000},{mes:"Fev/26",vitor:97500,larissa:74500},
-      {mes:"Mar/26",vitor:99000,larissa:76000},{mes:"Abr/26",vitor:101500,larissa:77000},
-      {mes:"Mai/26",vitor:103000,larissa:79000},
-    ];
-    // sobrescreve com snapshots reais salvos
-    const result=base.map(b=>{
-      const key=b.mes.replace("/","/20").replace("Jan/20","Jan/20").replace("Fev/20","Fev/20"); // já está no formato certo
-      // converte label "Jun/26" → "06/2026" para buscar no snapshots
-      const [m,y]=b.mes.split("/");
-      const mNum={"Jan":"01","Fev":"02","Mar":"03","Abr":"04","Mai":"05","Jun":"06","Jul":"07","Ago":"08","Set":"09","Out":"10","Nov":"11","Dez":"12"}[m];
-      const snapKey=`${mNum}/20${y}`;
-      const snap=snapshots[snapKey];
-      return snap?{...b,vitor:snap.vitor,larissa:snap.larissa}:b;
-    });
-    // adiciona mês atual se tiver snapshot
-    const mesK=mesAtual();
-    const snap=snapshots[mesK];
-    if(snap){result.push({mes:mesLabel(),vitor:snap.vitor,larissa:snap.larissa});}
-    return result;
+  // ── Detecta fechamento de mês: ao detectar mudança de mês, congela o snapshot anterior ──
+  useEffect(()=>{
+    const mesAtual=mesAtualKey();
+    const keys=Object.keys(snapshots);
+    // Garante que todos os snapshots de meses passados tenham flag "fechado"
+    const naoFechados=keys.filter(k=>k!==mesAtual&&!snapshots[k].fechado);
+    if(naoFechados.length>0){
+      setSnapshots(prev=>{
+        const novo={...prev};
+        naoFechados.forEach(k=>{novo[k]={...novo[k],fechado:true,fechadoEm:new Date().toISOString()};});
+        return novo;
+      });
+    }
   },[snapshots]);
+
+  // ── Histórico para gráficos: gera lista a partir dos snapshots reais ──
+  const histData=useMemo(()=>{
+    const keys=Object.keys(snapshots).sort(sortKeys);
+    if(keys.length===0)return [];
+    // Garante que aparecem os últimos 12 meses (preenche com 0 os meses sem dados, se houver)
+    const ultimos=ultimosMeses(12);
+    const mapa={};
+    keys.forEach(k=>{mapa[k]=snapshots[k];});
+    return ultimos.map(k=>({
+      key:k,
+      mes:keyToLabel(k),
+      vitor:mapa[k]?.vitor||0,
+      larissa:mapa[k]?.larissa||0,
+      fechado:mapa[k]?.fechado||false,
+    })).filter(h=>h.vitor>0||h.larissa>0);
+  },[snapshots]);
+
+  // ── Lucro mensal (delta de patrimônio) ──
+  const lucroMensal=useMemo(()=>{
+    if(histData.length<2)return [];
+    // Soma aportes (compras) e retiradas (vendas) por mês para descontar do delta
+    const fluxoMensal={};
+    operacoes.forEach(op=>{
+      const d=new Date(op.data);
+      const k=`${String(d.getMonth()+1).padStart(2,"0")}/${d.getFullYear()}`;
+      if(!fluxoMensal[k])fluxoMensal[k]={Vitor:0,Larissa:0};
+      const sig=op.tipo==="compra"?1:-1;
+      fluxoMensal[k][op.investidor]=(fluxoMensal[k][op.investidor]||0)+sig*op.total;
+    });
+    return histData.map((h,i)=>{
+      if(i===0)return {mes:h.mes,key:h.key,vitor:0,larissa:0,total:0};
+      const prev=histData[i-1];
+      const f=fluxoMensal[h.key]||{Vitor:0,Larissa:0};
+      // Lucro = ΔPatrimônio - aportes_líquidos
+      const lv=(h.vitor-prev.vitor)-f.Vitor;
+      const ll=(h.larissa-prev.larissa)-f.Larissa;
+      return {mes:h.mes,key:h.key,vitor:lv,larissa:ll,total:lv+ll};
+    });
+  },[histData,operacoes]);
 
   const log=(msg,type="info")=>setApiLog(p=>[{msg,type,ts:new Date().toLocaleTimeString("pt-BR")},...p].slice(0,15));
 
@@ -352,9 +401,18 @@ function AppInner({ onLogout }){
         if(pieInst.current)pieInst.current.destroy();
         pieInst.current=new Chart(pieRef.current,{type:"doughnut",data:{labels:byClass.map(([c])=>c),datasets:[{data:byClass.map(([,v])=>v),backgroundColor:byClass.map(([c])=>COLORS[c]||"#888"),borderWidth:2,borderColor:"rgba(15,30,60,0.5)"}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:"rgba(5,15,40,0.95)",bodyColor:"#fff",borderColor:"rgba(255,255,255,0.1)",borderWidth:1,callbacks:{label:c=>`${c.label}: ${fmtBRL(c.parsed)}`}}},cutout:"68%"}});
       }
+      if(lucroChartRef.current&&lucroMensal.length>0){
+        if(lucroChartInst.current)lucroChartInst.current.destroy();
+        const dadosLucro=investor==="Vitor"?lucroMensal.map(l=>l.vitor):investor==="Larissa"?lucroMensal.map(l=>l.larissa):lucroMensal.map(l=>l.total);
+        lucroChartInst.current=new Chart(lucroChartRef.current,{
+          type:"bar",
+          data:{labels:lucroMensal.map(l=>l.mes),datasets:[{label:"Lucro / Prejuízo",data:dadosLucro,backgroundColor:dadosLucro.map(v=>v>=0?"rgba(52,211,153,0.6)":"rgba(248,113,113,0.6)"),borderColor:dadosLucro.map(v=>v>=0?"#34d399":"#f87171"),borderWidth:1,borderRadius:6}]},
+          options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{backgroundColor:"rgba(5,15,40,0.95)",bodyColor:"#fff",borderColor:"rgba(255,255,255,0.1)",borderWidth:1,callbacks:{label:c=>` ${fmtBRL(c.parsed.y)}`}}},scales:{y:{ticks:{callback:v=>"R$"+(v/1000).toFixed(1)+"k",color:"rgba(255,255,255,0.4)",font:{size:10}},grid:{color:"rgba(255,255,255,0.05)"},border:{color:"transparent"}},x:{ticks:{color:"rgba(255,255,255,0.4)",font:{size:10}},grid:{display:false},border:{color:"transparent"}}}}
+        });
+      }
     },200);
     return()=>clearTimeout(t);
-  },[tab,byClass,histData]);
+  },[tab,byClass,histData,lucroMensal,investor]);
 
   // ── Estilos ─────────────────────────────────────────────────────────────────
   const glass={background:"rgba(255,255,255,0.07)",border:"1px solid rgba(255,255,255,0.13)",borderRadius:16,padding:"1rem 1.25rem",backdropFilter:"blur(8px)"};
@@ -761,12 +819,40 @@ function AppInner({ onLogout }){
               </div>
             </div>
             <p style={{fontWeight:500,fontSize:13,margin:"0 0 0.75rem",color:"rgba(255,255,255,0.8)"}}>Rentabilidade por classe</p>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:10}}>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(190px,1fr))",gap:10,marginBottom:"1.25rem"}}>
               {byClass.map(([cl,val])=>{
                 const cus=filtA.filter(a=>a.classe===cl).reduce((s,a)=>s+toCusto(a,usdBrl),0);
                 const rent=cus>0?(val-cus)/cus*100:0;
                 return(<div key={cl} style={{...glass,display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}><div style={{width:10,height:10,borderRadius:2,background:COLORS[cl]||"#888"}}></div><span style={{fontSize:12,fontWeight:500,color:"#fff"}}>{cl}</span></div><p style={{fontSize:11,color:"rgba(255,255,255,0.5)",margin:0}}>{fmtBRL(val)}</p></div><p style={{fontSize:16,fontWeight:500,margin:0,color:rent>=0?"#86efac":"#fca5a5"}}>{fmtPct(rent)}</p></div>);
               })}
+            </div>
+
+            {/* Lucro / Prejuízo mensal */}
+            <div style={glass}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                <p style={{fontWeight:500,fontSize:13,margin:0,color:"rgba(255,255,255,0.8)"}}>Lucro / Prejuízo mensal</p>
+                <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:0}}>
+                  {investor==="Todos"?"Família consolidado":investor} · valoração - aportes líquidos
+                </p>
+              </div>
+              {lucroMensal.length<2
+                ?<p style={{fontSize:12,color:"rgba(255,255,255,0.4)",textAlign:"center",padding:"1rem"}}>Histórico ainda insuficiente — necessário ao menos 2 meses de dados.</p>
+                :<>
+                  <div style={{position:"relative",height:200}}><canvas ref={lucroChartRef}/></div>
+                  {(()=>{
+                    const acum=lucroMensal.reduce((s,l)=>s+(investor==="Vitor"?l.vitor:investor==="Larissa"?l.larissa:l.total),0);
+                    const positivos=lucroMensal.filter(l=>(investor==="Vitor"?l.vitor:investor==="Larissa"?l.larissa:l.total)>0).length;
+                    const negativos=lucroMensal.filter(l=>(investor==="Vitor"?l.vitor:investor==="Larissa"?l.larissa:l.total)<0).length;
+                    return(
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginTop:12}}>
+                        <div style={{background:"rgba(255,255,255,0.06)",borderRadius:8,padding:"8px 10px"}}><p style={{fontSize:10,color:"rgba(255,255,255,0.5)",margin:0}}>Acumulado</p><p style={{fontSize:15,fontWeight:500,margin:"2px 0 0",color:acum>=0?"#86efac":"#fca5a5"}}>{fmtBRL(acum)}</p></div>
+                        <div style={{background:"rgba(255,255,255,0.06)",borderRadius:8,padding:"8px 10px"}}><p style={{fontSize:10,color:"rgba(255,255,255,0.5)",margin:0}}>Meses positivos</p><p style={{fontSize:15,fontWeight:500,margin:"2px 0 0",color:"#86efac"}}>{positivos}</p></div>
+                        <div style={{background:"rgba(255,255,255,0.06)",borderRadius:8,padding:"8px 10px"}}><p style={{fontSize:10,color:"rgba(255,255,255,0.5)",margin:0}}>Meses negativos</p><p style={{fontSize:15,fontWeight:500,margin:"2px 0 0",color:"#fca5a5"}}>{negativos}</p></div>
+                      </div>
+                    );
+                  })()}
+                </>
+              }
             </div>
           </div>
         )}
