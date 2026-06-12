@@ -3,8 +3,6 @@ import { Chart, registerables } from "chart.js";
 Chart.register(...registerables);
 
 // ── Autenticação via backend ──────────────────────────────────────────────────
-const API = "https://investimentos-backend.onrender.com";
-
 function getToken() { return sessionStorage.getItem("inv_token"); }
 function setToken(t) { sessionStorage.setItem("inv_token", t); }
 function clearToken() { sessionStorage.removeItem("inv_token"); }
