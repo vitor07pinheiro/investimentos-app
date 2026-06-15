@@ -112,29 +112,61 @@ const fmtPct = v => (v>=0?"+":"")+fmt(v,2)+"%";
 
 const isRendaFixa = a => ["Tesouro Direto","CDB/LCI/LCA"].includes(a.classe);
 
-// Calcula valor presente de um título de renda fixa a partir da data de compra
-// Indexadores: pre / cdi / ipca / selic
-// taxa: % do CDI (ex: 110) OU taxa fixa anual (ex: 5.5 para IPCA+5.5%)
-function calcValorRF(ativo, indicadores) {
+// Calcula valor presente de renda fixa usando fatores acumulados reais quando disponíveis
+// fatoresAcum: { [ativo_id]: { ipca: 1.0834, cdi: 1.1245, dias: 540 } }
+function calcValorRF(ativo, indicadores, fatoresAcum) {
   if (!ativo.data_compra || !ativo.indexador) return ativo.preco_medio;
   const valorInicial = ativo.preco_medio;
   const dias = Math.max(1, Math.floor((new Date()-new Date(ativo.data_compra))/(1000*60*60*24)));
   const anos = dias/365;
-  const cdi   = (indicadores?.cdi_anual || 10.65)/100;
-  const selic = (indicadores?.selic     || 11.0)/100;
-  const ipcaMensal = (indicadores?.ipca_mensal || 0.4)/100;
-  const ipcaAnual  = Math.pow(1+ipcaMensal,12)-1;
-  let taxaAnual = 0;
+  const taxaContratada = (ativo.taxa||0)/100;
+  const fatAcum = fatoresAcum?.[ativo.id];
+
   switch(ativo.indexador){
-    case "pre":   taxaAnual = (ativo.taxa||0)/100; break;
-    case "cdi":   // taxa é "% do CDI" (ex: 110) ou "CDI + spread" se tiver ativo.spread
-                  if(ativo.modo_cdi==="percentual") taxaAnual = cdi * (ativo.taxa||100)/100;
-                  else taxaAnual = cdi + (ativo.taxa||0)/100; break;
-    case "ipca":  taxaAnual = ipcaAnual + (ativo.taxa||0)/100; break;
-    case "selic": taxaAnual = selic + (ativo.taxa||0)/100; break;
+    case "pre":
+      return valorInicial * Math.pow(1+taxaContratada, anos);
+
+    case "cdi": {
+      if (fatAcum?.cdi) {
+        // CDI acumulado real do período
+        const fatorCDI = fatAcum.cdi;
+        if (ativo.modo_cdi === "percentual") {
+          // Aplica o percentual do CDI: (1+cdi)^pct - 1 ≈ pct * cdi para variações pequenas
+          // Forma mais precisa: fator^(pct/100)
+          return valorInicial * Math.pow(fatorCDI, (ativo.taxa||100)/100);
+        } else {
+          // CDI + spread: CDI acumulado real × spread anualizado
+          return valorInicial * fatorCDI * Math.pow(1+taxaContratada, anos);
+        }
+      }
+      // Fallback: estimativa via CDI anual atual
+      const cdi = (indicadores?.cdi_anual || 10.65)/100;
+      const taxa = ativo.modo_cdi==="percentual" ? cdi*(ativo.taxa||100)/100 : cdi+taxaContratada;
+      return valorInicial * Math.pow(1+taxa, anos);
+    }
+
+    case "ipca": {
+      if (fatAcum?.ipca) {
+        // IPCA acumulado real × juros contratados anualizados pro período
+        return valorInicial * fatAcum.ipca * Math.pow(1+taxaContratada, anos);
+      }
+      // Fallback: projeção pelo IPCA mensal atual
+      const ipcaMensal = (indicadores?.ipca_mensal || 0.4)/100;
+      const ipcaAnual  = Math.pow(1+ipcaMensal,12)-1;
+      return valorInicial * Math.pow(1+ipcaAnual+taxaContratada, anos);
+    }
+
+    case "selic": {
+      // Selic ≈ CDI, usa fator de CDI acumulado se houver
+      if (fatAcum?.cdi) {
+        return valorInicial * fatAcum.cdi * Math.pow(1+taxaContratada, anos);
+      }
+      const selic = (indicadores?.selic || 11.0)/100;
+      return valorInicial * Math.pow(1+selic+taxaContratada, anos);
+    }
+
     default: return valorInicial;
   }
-  return valorInicial * Math.pow(1+taxaAnual, anos);
 }
 
 // Chave do mês corrente no formato "MM/YYYY"
@@ -162,14 +194,14 @@ const ultimosMeses = (n) => {
 
 function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
 function saveState(s){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch(e){}}
-function toVal(a,r=5.25,ind=null){
+function toVal(a,r=5.25,ind=null,fatAcum=null){
   if(isRendaFixa(a)&&a.indexador){
-    return calcValorRF(a,ind) * a.qtd;
+    return calcValorRF(a,ind,fatAcum) * a.qtd;
   }
   return a.qtd*a.preco_atual*(a.moeda==="USD"?r:1);
 }
 function toCusto(a,r=5.25){return a.qtd*a.preco_medio*(a.moeda==="USD"?r:1);}
-function toRent(a,r=5.25,ind=null){const v=toVal(a,r,ind),c=toCusto(a,r);return c>0?(v-c)/c*100:0;}
+function toRent(a,r=5.25,ind=null,fatAcum=null){const v=toVal(a,r,ind,fatAcum),c=toCusto(a,r);return c>0?(v-c)/c*100:0;}
 
 function StatusBadge({status,msg}){
   const cfg={ok:{bg:"rgba(52,211,153,0.2)",color:"#6ee7b7",icon:"ti-circle-check"},loading:{bg:"rgba(96,165,250,0.2)",color:"#93c5fd",icon:"ti-loader"},error:{bg:"rgba(248,113,113,0.2)",color:"#fca5a5",icon:"ti-alert-circle"},warn:{bg:"rgba(251,191,36,0.2)",color:"#fde68a",icon:"ti-alert-triangle"}};
@@ -216,7 +248,8 @@ function AppInner({ onLogout }){
   const [carteiraFiltro,setCarteiraFiltro]=useState("ativos"); // "ativos" | "zerados"
   const [goalsTotal,setGoalsTotal]=useState(saved?.goalsTotal||{Vitor:200000,Larissa:150000});
   const [goalsClass,setGoalsClass]=useState(saved?.goalsClass||CLASS_GOALS);
-  const [editandoMeta,setEditandoMeta]=useState(null); // "Vitor" | "Larissa" | null
+  const [editandoMeta,setEditandoMeta]=useState(null);
+  const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{}); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
   const [tab,setTab]=useState("dashboard");
   const [investor,setInvestor]=useState("Todos");
   const [usdBrl,setUsdBrl]=useState(saved?.usdBrl||5.25);
@@ -240,20 +273,20 @@ function AppInner({ onLogout }){
   useEffect(()=>{assetsRef.current=assets;},[assets]);
 
   // ── Salvar estado ───────────────────────────────────────────────────────────
-  useEffect(()=>{saveState({assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass});},[assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass]);
+  useEffect(()=>{saveState({assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass,fatoresAcum});},[assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass,fatoresAcum]);
 
   // ── Snapshot mensal dinâmico: atualiza o mês vigente sempre que ativos ou câmbio mudam ──
   // Snapshots de meses anteriores ficam imutáveis (criados quando o mês fecha ou via carga histórica)
   useEffect(()=>{
     const mes=mesAtualKey();
-    const vitor=assets.filter(a=>a.investidor==="Vitor").reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
-    const larissa=assets.filter(a=>a.investidor==="Larissa").reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
+    const vitor=assets.filter(a=>a.investidor==="Vitor").reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
+    const larissa=assets.filter(a=>a.investidor==="Larissa").reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
     setSnapshots(prev=>{
       const cur=prev[mes];
       if(cur&&Math.abs(cur.vitor-vitor)<0.01&&Math.abs(cur.larissa-larissa)<0.01)return prev;
       return {...prev,[mes]:{vitor,larissa,atualizado:new Date().toISOString()}};
     });
-  },[assets,usdBrl,indicadores]);
+  },[assets,usdBrl,indicadores,fatoresAcum]);
 
   // ── Detecta fechamento de mês: ao detectar mudança de mês, congela o snapshot anterior ──
   useEffect(()=>{
@@ -319,6 +352,36 @@ function AppInner({ onLogout }){
     log("Iniciando atualização...");
     try{const r=await apiFetch(`${API}/api/cambio`,{},authFail);const d=await r.json();if(d.usd_brl){setUsdBrl(d.usd_brl);log(`Câmbio: R$ ${d.usd_brl.toFixed(4)} (${d.fonte})`,"ok");}else{log("Câmbio: sem dado, mantendo último valor","warn");}setApiStatus(s=>({...s,cambio:"ok"}));}catch(e){log("Câmbio: erro","error");setApiStatus(s=>({...s,cambio:"error"}));}
     try{const r=await apiFetch(`${API}/api/indicadores`,{},authFail);const d=await r.json();setIndicadores(d);log(`CDI ${d.cdi_anual}% · Selic ${d.selic}% · IPCA ${d.ipca_mensal}%/mês`,"ok");setApiStatus(s=>({...s,indicadores:"ok"}));}catch(e){log("Indicadores: erro","error");setApiStatus(s=>({...s,indicadores:"error"}));}
+
+    // ── Busca fatores IPCA/CDI acumulados para cada ativo de renda fixa ──
+    const rfAtivos = cur.filter(a=>isRendaFixa(a)&&a.indexador&&a.data_compra);
+    if(rfAtivos.length>0){
+      const novos={};
+      for(const a of rfAtivos){
+        try{
+          const reqs=[];
+          if(a.indexador==="ipca") reqs.push(["ipca",apiFetch(`${API}/api/ipca-acumulado?inicio=${a.data_compra}`,{},authFail)]);
+          if(a.indexador==="cdi"||a.indexador==="selic") reqs.push(["cdi",apiFetch(`${API}/api/cdi-acumulado?inicio=${a.data_compra}`,{},authFail)]);
+          const resultados=await Promise.all(reqs.map(([_,p])=>p));
+          const obj={};
+          reqs.forEach(([tipo,_],i)=>{
+            if(resultados[i].ok){
+              resultados[i].json().then(d=>{obj[tipo]=d.fator;});
+            }
+          });
+          // Aguarda parsing
+          for(let i=0;i<reqs.length;i++){
+            if(resultados[i].ok){
+              const d=await resultados[i].clone().json();
+              obj[reqs[i][0]]=d.fator;
+            }
+          }
+          novos[a.id]=obj;
+        }catch(e){}
+      }
+      setFatoresAcum(p=>({...p,...novos}));
+      log(`Renda Fixa: fatores históricos atualizados para ${rfAtivos.length} ativo(s)`,"ok");
+    }
     const b3=cur.filter(a=>["Ações B3","FIIs B3"].includes(a.classe));
     if(b3.length>0){try{const tickers=[...new Set(b3.map(a=>a.ticker))].join(",");const r=await apiFetch(`${API}/api/cotacoes/b3?tickers=${tickers}`,{},authFail);const d=await r.json();if(d.cotacoes){setAssets(p=>p.map(a=>{const q=d.cotacoes.find(c=>c.ticker===a.ticker);return q?{...a,preco_atual:q.preco,variacao_dia:q.variacao_dia}:a;}));log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");}}catch(e){log("B3: erro","error");}}
     const eua=cur.filter(a=>["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
@@ -332,11 +395,11 @@ function AppInner({ onLogout }){
 
   const filtA=useMemo(()=>investor==="Todos"?assets:assets.filter(a=>a.investidor===investor),[assets,investor]);
   const filtP=useMemo(()=>investor==="Todos"?provs:provs.filter(p=>p.investidor===investor),[provs,investor]);
-  const totalPatrim=filtA.reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
+  const totalPatrim=filtA.reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
   const totalCusto=filtA.reduce((s,a)=>s+toCusto(a,usdBrl),0);
   const totalRent=totalCusto>0?(totalPatrim-totalCusto)/totalCusto*100:0;
   const totalProv=filtP.reduce((s,p)=>s+(p.moeda==="USD"?p.valor*usdBrl:p.valor),0);
-  const byClass=useMemo(()=>{const m={};filtA.forEach(a=>{if(!m[a.classe])m[a.classe]=0;m[a.classe]+=toVal(a,usdBrl,indicadores);});return Object.entries(m).sort((x,y)=>y[1]-x[1]);},[filtA,usdBrl,indicadores]);
+  const byClass=useMemo(()=>{const m={};filtA.forEach(a=>{if(!m[a.classe])m[a.classe]=0;m[a.classe]+=toVal(a,usdBrl,indicadores,fatoresAcum);});return Object.entries(m).sort((x,y)=>y[1]-x[1]);},[filtA,usdBrl,indicadores,fatoresAcum]);
 
   // ── Reconstrói a carteira a partir da lista de operações (usado após edição/exclusão) ──
   function reconstruirCarteira(ops, ativosAtuais) {
@@ -644,11 +707,11 @@ function AppInner({ onLogout }){
                 <p style={{fontWeight:500,fontSize:13,margin:"0 0 12px",color:"rgba(255,255,255,0.8)"}}>Por investidor</p>
                 {["Vitor","Larissa"].map(inv=>{
                   const ats=assets.filter(a=>a.investidor===inv);
-                  const pat=ats.reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
+                  const pat=ats.reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
                   const cus=ats.reduce((s,a)=>s+toCusto(a,usdBrl),0);
                   const ren=cus>0?(pat-cus)/cus*100:0;
                   const prv=provs.filter(p=>p.investidor===inv).reduce((s,p)=>s+(p.moeda==="USD"?p.valor*usdBrl:p.valor),0);
-                  const tot=assets.reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
+                  const tot=assets.reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
                   return(
                     <div key={inv} style={{marginBottom:14,paddingBottom:14,borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
                       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
@@ -695,8 +758,8 @@ function AppInner({ onLogout }){
                     <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Ticker","Investidor","Classe","Qtd","P. Médio","Cotação","Var. Dia","Valor","Rent.","Lucro Realizado","Proventos"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
                     <tbody>
                       {filtA.map((a,i)=>{
-                        const rent=toRent(a,usdBrl,indicadores);
-                        const valorAtual=toVal(a,usdBrl,indicadores)/a.qtd;
+                        const rent=toRent(a,usdBrl,indicadores,fatoresAcum);
+                        const valorAtual=toVal(a,usdBrl,indicadores,fatoresAcum)/a.qtd;
                         const lucro=a.lucroRealizado||0;
                         const isRF=isRendaFixa(a)&&a.indexador;
                         return(
@@ -708,7 +771,7 @@ function AppInner({ onLogout }){
                             <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{a.moeda==="USD"?fmtUSD(a.preco_medio):fmtBRL(a.preco_medio)}</td>
                             <td style={{padding:"8px 10px",color:"#fff",fontWeight:500}}>{a.moeda==="USD"?fmtUSD(valorAtual):fmtBRL(valorAtual)}</td>
                             <td style={{padding:"8px 10px",color:a.variacao_dia>=0?"#86efac":"#fca5a5",fontSize:11}}>{a.variacao_dia!=null&&!isRF?fmtPct(a.variacao_dia):"—"}</td>
-                            <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(toVal(a,usdBrl,indicadores))}</td>
+                            <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(toVal(a,usdBrl,indicadores,fatoresAcum))}</td>
                             <td style={{padding:"8px 10px",color:rent>=0?"#86efac":"#fca5a5",fontWeight:500}}>{fmtPct(rent)}</td>
                             <td style={{padding:"8px 10px",fontWeight:500,color:lucro>=0?"#86efac":"#fca5a5"}}>{lucro!==0?fmtBRL(lucro):"—"}</td>
                             <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(a.proventos)}</td>
@@ -1096,11 +1159,11 @@ function AppInner({ onLogout }){
             {["Vitor","Larissa"].map(inv=>{
               if(investor!=="Todos"&&investor!==inv)return null;
               const ats=assets.filter(a=>a.investidor===inv);
-              const pat=ats.reduce((s,a)=>s+toVal(a,usdBrl,indicadores),0);
+              const pat=ats.reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
               const meta=goalsTotal[inv];
               const pct=Math.min(pat/meta*100,100);
               const goals=goalsClass[inv];
-              const byC={};ats.forEach(a=>{if(!byC[a.classe])byC[a.classe]=0;byC[a.classe]+=toVal(a,usdBrl,indicadores);});
+              const byC={};ats.forEach(a=>{if(!byC[a.classe])byC[a.classe]=0;byC[a.classe]+=toVal(a,usdBrl,indicadores,fatoresAcum);});
               const editando=editandoMeta===inv;
               return(
                 <div key={inv} style={{...glass,marginBottom:12}}>
