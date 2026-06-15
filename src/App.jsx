@@ -110,61 +110,71 @@ const fmtBRL = v => "R$ "+fmt(v);
 const fmtUSD = v => "US$ "+fmt(v);
 const fmtPct = v => (v>=0?"+":"")+fmt(v,2)+"%";
 
+// Calcula valor presente de um lote de renda fixa
+function calcValorLote(lote, indicadores, fatoresAcum) {
+  if (!lote.data_compra || !lote.indexador) return lote.valor_inicial;
+  const valorInicial = lote.valor_inicial;
+  const dias = Math.max(1, Math.floor((new Date()-new Date(lote.data_compra))/(1000*60*60*24)));
+  const anos = dias/365;
+  const taxaContratada = (lote.taxa||0)/100;
+  const fatAcum = fatoresAcum?.[lote.id];
+
+  switch(lote.indexador){
+    case "pre":
+      return valorInicial * Math.pow(1+taxaContratada, anos);
+    case "cdi": {
+      if (fatAcum?.cdi) {
+        return lote.modo_cdi==="percentual"
+          ? valorInicial * Math.pow(fatAcum.cdi, lote.taxa/100)
+          : valorInicial * fatAcum.cdi * Math.pow(1+taxaContratada, anos);
+      }
+      const cdi = (indicadores?.cdi_anual||10.65)/100;
+      const taxa = lote.modo_cdi==="percentual" ? cdi*lote.taxa/100 : cdi+taxaContratada;
+      return valorInicial * Math.pow(1+taxa, anos);
+    }
+    case "ipca": {
+      if (fatAcum?.ipca) return valorInicial * fatAcum.ipca * Math.pow(1+taxaContratada, anos);
+      const ipcaA = Math.pow(1+(indicadores?.ipca_mensal||0.4)/100,12)-1;
+      return valorInicial * Math.pow(1+ipcaA+taxaContratada, anos);
+    }
+    case "selic": {
+      if (fatAcum?.cdi) return valorInicial * fatAcum.cdi * Math.pow(1+taxaContratada, anos);
+      return valorInicial * Math.pow(1+(indicadores?.selic||11)/100+taxaContratada, anos);
+    }
+    default: return valorInicial;
+  }
+}
+
 const isRendaFixa = a => ["Tesouro Direto","CDB/LCI/LCA"].includes(a.classe);
 
-// Calcula valor presente de renda fixa usando fatores acumulados reais quando disponíveis
-// fatoresAcum: { [ativo_id]: { ipca: 1.0834, cdi: 1.1245, dias: 540 } }
+// Para ativos normais (não RF com lotes): calcula valor presente
 function calcValorRF(ativo, indicadores, fatoresAcum) {
   if (!ativo.data_compra || !ativo.indexador) return ativo.preco_medio;
+  // Se tem lotes, soma valor presente de cada lote
+  if (ativo.lotes && ativo.lotes.length > 0) {
+    return ativo.lotes.reduce((s,l) => s + calcValorLote(l, indicadores, fatoresAcum), 0) / ativo.qtd;
+  }
+  // Sem lotes: cálculo simples (legado)
   const valorInicial = ativo.preco_medio;
   const dias = Math.max(1, Math.floor((new Date()-new Date(ativo.data_compra))/(1000*60*60*24)));
   const anos = dias/365;
   const taxaContratada = (ativo.taxa||0)/100;
   const fatAcum = fatoresAcum?.[ativo.id];
-
   switch(ativo.indexador){
-    case "pre":
-      return valorInicial * Math.pow(1+taxaContratada, anos);
-
+    case "pre": return valorInicial * Math.pow(1+taxaContratada, anos);
     case "cdi": {
-      if (fatAcum?.cdi) {
-        // CDI acumulado real do período
-        const fatorCDI = fatAcum.cdi;
-        if (ativo.modo_cdi === "percentual") {
-          // Aplica o percentual do CDI: (1+cdi)^pct - 1 ≈ pct * cdi para variações pequenas
-          // Forma mais precisa: fator^(pct/100)
-          return valorInicial * Math.pow(fatorCDI, (ativo.taxa||100)/100);
-        } else {
-          // CDI + spread: CDI acumulado real × spread anualizado
-          return valorInicial * fatorCDI * Math.pow(1+taxaContratada, anos);
-        }
-      }
-      // Fallback: estimativa via CDI anual atual
-      const cdi = (indicadores?.cdi_anual || 10.65)/100;
-      const taxa = ativo.modo_cdi==="percentual" ? cdi*(ativo.taxa||100)/100 : cdi+taxaContratada;
-      return valorInicial * Math.pow(1+taxa, anos);
+      if (fatAcum?.cdi) return ativo.modo_cdi==="percentual" ? valorInicial*Math.pow(fatAcum.cdi,ativo.taxa/100) : valorInicial*fatAcum.cdi*Math.pow(1+taxaContratada,anos);
+      const cdi=(indicadores?.cdi_anual||10.65)/100;
+      return valorInicial*Math.pow(1+(ativo.modo_cdi==="percentual"?cdi*ativo.taxa/100:cdi+taxaContratada),anos);
     }
-
     case "ipca": {
-      if (fatAcum?.ipca) {
-        // IPCA acumulado real × juros contratados anualizados pro período
-        return valorInicial * fatAcum.ipca * Math.pow(1+taxaContratada, anos);
-      }
-      // Fallback: projeção pelo IPCA mensal atual
-      const ipcaMensal = (indicadores?.ipca_mensal || 0.4)/100;
-      const ipcaAnual  = Math.pow(1+ipcaMensal,12)-1;
-      return valorInicial * Math.pow(1+ipcaAnual+taxaContratada, anos);
+      if (fatAcum?.ipca) return valorInicial*fatAcum.ipca*Math.pow(1+taxaContratada,anos);
+      return valorInicial*Math.pow(1+Math.pow(1+(indicadores?.ipca_mensal||0.4)/100,12)-1+taxaContratada,anos);
     }
-
     case "selic": {
-      // Selic ≈ CDI, usa fator de CDI acumulado se houver
-      if (fatAcum?.cdi) {
-        return valorInicial * fatAcum.cdi * Math.pow(1+taxaContratada, anos);
-      }
-      const selic = (indicadores?.selic || 11.0)/100;
-      return valorInicial * Math.pow(1+selic+taxaContratada, anos);
+      if (fatAcum?.cdi) return valorInicial*fatAcum.cdi*Math.pow(1+taxaContratada,anos);
+      return valorInicial*Math.pow(1+(indicadores?.selic||11)/100+taxaContratada,anos);
     }
-
     default: return valorInicial;
   }
 }
@@ -196,7 +206,11 @@ function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return J
 function saveState(s){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch(e){}}
 function toVal(a,r=5.25,ind=null,fatAcum=null){
   if(isRendaFixa(a)&&a.indexador){
-    return calcValorRF(a,ind,fatAcum) * a.qtd;
+    // Se tem lotes, soma valor presente de cada lote individualmente
+    if(a.lotes&&a.lotes.length>0){
+      return a.lotes.reduce((s,l)=>s+calcValorLote(l,ind,fatAcum),0);
+    }
+    return calcValorRF(a,ind,fatAcum)*a.qtd;
   }
   return a.qtd*a.preco_atual*(a.moeda==="USD"?r:1);
 }
@@ -249,7 +263,9 @@ function AppInner({ onLogout }){
   const [goalsTotal,setGoalsTotal]=useState(saved?.goalsTotal||{Vitor:200000,Larissa:150000});
   const [goalsClass,setGoalsClass]=useState(saved?.goalsClass||CLASS_GOALS);
   const [editandoMeta,setEditandoMeta]=useState(null);
-  const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{}); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
+  const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{});
+  const [expandedRows,setExpandedRows]=useState({});
+  const [expandedClasses,setExpandedClasses]=useState({}); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
   const [tab,setTab]=useState("dashboard");
   const [investor,setInvestor]=useState("Todos");
   const [usdBrl,setUsdBrl]=useState(saved?.usdBrl||5.25);
@@ -292,24 +308,28 @@ function AppInner({ onLogout }){
   const buscarFatoresRF = useCallback(async (ativosRF) => {
     if (!ativosRF || ativosRF.length === 0) return;
     const novos = {};
-    await Promise.all(ativosRF.map(async a => {
+    // Coleta todos os lotes de todos os ativos RF
+    const todosLotes = [];
+    ativosRF.forEach(a => {
+      if (a.lotes && a.lotes.length > 0) {
+        a.lotes.forEach(l => { if(l.indexador!=="pre") todosLotes.push(l); });
+      } else if (a.indexador && a.indexador !== "pre") {
+        todosLotes.push({id:a.id, indexador:a.indexador, data_compra:a.data_compra, taxa:a.taxa, modo_cdi:a.modo_cdi});
+      }
+    });
+    await Promise.all(todosLotes.map(async l => {
       try {
-        const rota = a.indexador === "ipca"
-          ? `${API}/api/ipca-acumulado?inicio=${a.data_compra}`
-          : `${API}/api/cdi-acumulado?inicio=${a.data_compra}`;
+        const rota = l.indexador==="ipca"
+          ? `${API}/api/ipca-acumulado?inicio=${l.data_compra}`
+          : `${API}/api/cdi-acumulado?inicio=${l.data_compra}`;
         const r = await apiFetch(rota, {});
-        if (!r || !r.ok) return;
+        if (!r||!r.ok) return;
         const d = await r.json();
-        if (!d || !d.fator) return;
-        novos[a.id] = a.indexador === "ipca" ? { ipca: d.fator } : { cdi: d.fator };
-        console.log(`Fator ${a.indexador} para ${a.ticker} (id:${a.id}):`, d.fator);
-      } catch(e) { console.error("Erro fator RF:", a.ticker, e); }
+        if (!d||!d.fator) return;
+        novos[l.id] = l.indexador==="ipca" ? {ipca:d.fator} : {cdi:d.fator};
+      } catch(e) {}
     }));
-    console.log("Novos fatores:", novos);
-    if (Object.keys(novos).length > 0) {
-      setFatoresAcum(prev => ({ ...prev, ...novos }));
-    }
-    return novos;
+    if (Object.keys(novos).length > 0) setFatoresAcum(prev=>({...prev,...novos}));
   }, []);
 
   // ── Dispara busca de fatores toda vez que os ativos de RF mudam ──
@@ -510,19 +530,44 @@ function AppInner({ onLogout }){
 
       if(form.tipo==="compra"){
         const ex=assetsRef.current.find(a=>a.ticker===ticker&&a.investidor===form.investidor);
+        const isRF=["Tesouro Direto","CDB/LCI/LCA"].includes(form.classe);
         if(ex){
-          const nq=ex.qtd+parseFloat(form.qtd);
-          const nm=(ex.qtd*ex.preco_medio+parseFloat(form.qtd)*parseFloat(form.preco))/nq;
-          setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:nq,preco_medio:nm}:a));
+          if(isRF){
+            // RF: adiciona novo lote independente (taxa e data próprias)
+            const novoLote={
+              id: Date.now()+2,
+              valor_inicial: parseFloat(form.preco)*parseFloat(form.qtd),
+              qtd: parseFloat(form.qtd),
+              preco_unitario: parseFloat(form.preco),
+              data_compra: form.data,
+              indexador: form.indexador,
+              taxa: parseFloat(form.taxa)||0,
+              modo_cdi: form.modo_cdi,
+              vencimento: form.vencimento||null,
+            };
+            const novosLotes=[...(ex.lotes||[
+              // Se ainda não tinha lotes, converte o ativo existente em lote
+              {id:ex.id,valor_inicial:ex.preco_medio*ex.qtd,qtd:ex.qtd,preco_unitario:ex.preco_medio,data_compra:ex.data_compra,indexador:ex.indexador,taxa:ex.taxa,modo_cdi:ex.modo_cdi,vencimento:ex.vencimento}
+            ]),novoLote];
+            const novaQtd=novosLotes.reduce((s,l)=>s+l.qtd,0);
+            const novoValorTotal=novosLotes.reduce((s,l)=>s+l.valor_inicial,0);
+            setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:novaQtd,preco_medio:novoValorTotal/novaQtd,lotes:novosLotes}:a));
+          } else {
+            // Ações/outros: preço médio ponderado normal
+            const nq=ex.qtd+parseFloat(form.qtd);
+            const nm=(ex.qtd*ex.preco_medio+parseFloat(form.qtd)*parseFloat(form.preco))/nq;
+            setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:nq,preco_medio:nm}:a));
+          }
         } else {
           isNew=true;
           const novoAtivo={id:Date.now()+1,ticker,nome:form.nome||ticker,classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco_medio:parseFloat(form.preco),preco_atual:parseFloat(form.preco),moeda:form.moeda,proventos:0,lucroRealizado:0,data_compra:form.data};
-          // Se for renda fixa, salva indexador e taxa
-          if(["Tesouro Direto","CDB/LCI/LCA"].includes(form.classe)){
+          if(isRF){
             novoAtivo.indexador=form.indexador;
             novoAtivo.taxa=parseFloat(form.taxa)||0;
             novoAtivo.modo_cdi=form.modo_cdi;
             novoAtivo.vencimento=form.vencimento||null;
+            // Cria o primeiro lote
+            novoAtivo.lotes=[{id:Date.now()+2,valor_inicial:parseFloat(form.preco)*parseFloat(form.qtd),qtd:parseFloat(form.qtd),preco_unitario:parseFloat(form.preco),data_compra:form.data,indexador:form.indexador,taxa:parseFloat(form.taxa)||0,modo_cdi:form.modo_cdi,vencimento:form.vencimento||null}];
           }
           setAssets(p=>[...p,novoAtivo]);
         }
@@ -772,43 +817,137 @@ function AppInner({ onLogout }){
             {carteiraFiltro==="ativos"&&(
               filtA.length===0
                 ?<div style={{...glass,textAlign:"center",padding:"2rem"}}><i className="ti ti-inbox" style={{fontSize:32,color:"rgba(255,255,255,0.3)"}}/><p style={{color:"rgba(255,255,255,0.4)",margin:"8px 0 0",fontSize:13}}>Nenhum ativo. Use a aba Lançamentos para adicionar.</p></div>
-                :<div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
-                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                    <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Ticker","Investidor","Classe","Qtd","P. Médio","Cotação","Var. Dia","Valor","Rent.","Lucro Realizado","Proventos"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
-                    <tbody>
-                      {filtA.map((a,i)=>{
-                        const rent=toRent(a,usdBrl,indicadores,fatoresAcum);
-                        const valorAtual=toVal(a,usdBrl,indicadores,fatoresAcum)/a.qtd;
-                        const lucro=a.lucroRealizado||0;
-                        const isRF=isRendaFixa(a)&&a.indexador;
-                        return(
-                          <tr key={a.id} style={{borderTop:"1px solid rgba(255,255,255,0.06)",background:i%2===0?"rgba(255,255,255,0.02)":"transparent"}}>
-                            <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{a.ticker}{isRF&&<span style={{fontSize:9,color:"#fde68a",marginLeft:5,padding:"1px 5px",borderRadius:4,background:"rgba(251,191,36,0.15)"}}>RF</span>}</td>
-                            <td style={{padding:"8px 10px"}}><span style={badge(a.investidor)}>{a.investidor}</span></td>
-                            <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.55)",fontSize:11}}>{a.classe}{isRF&&<div style={{fontSize:10,color:"rgba(255,255,255,0.4)"}}>{a.indexador==="cdi"?(a.modo_cdi==="percentual"?`${a.taxa}% CDI`:`CDI+${a.taxa}%`):a.indexador==="pre"?`Pré ${a.taxa}%`:`${a.indexador.toUpperCase()}+${a.taxa}%`}</div>}</td>
-                            <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{fmt(a.qtd,a.qtd<1?6:2)}</td>
-                            <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{a.moeda==="USD"?fmtUSD(a.preco_medio):fmtBRL(a.preco_medio)}</td>
-                            <td style={{padding:"8px 10px",color:"#fff",fontWeight:500}}>{a.moeda==="USD"?fmtUSD(valorAtual):fmtBRL(valorAtual)}</td>
-                            <td style={{padding:"8px 10px",color:a.variacao_dia>=0?"#86efac":"#fca5a5",fontSize:11}}>{a.variacao_dia!=null&&!isRF?fmtPct(a.variacao_dia):"—"}</td>
-                            <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(toVal(a,usdBrl,indicadores,fatoresAcum))}</td>
-                            <td style={{padding:"8px 10px",color:rent>=0?"#86efac":"#fca5a5",fontWeight:500}}>{fmtPct(rent)}</td>
-                            <td style={{padding:"8px 10px",fontWeight:500,color:lucro>=0?"#86efac":"#fca5a5"}}>{lucro!==0?fmtBRL(lucro):"—"}</td>
-                            <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(a.proventos)}</td>
+                :(()=>{
+                  // Agrupa ativos por classe
+                  const porClasse={};
+                  filtA.forEach(a=>{
+                    if(!porClasse[a.classe]) porClasse[a.classe]=[];
+                    porClasse[a.classe].push(a);
+                  });
+                  // Ordena classes pela ordem de CLASSES
+                  const classesOrdenadas=CLASSES.filter(c=>porClasse[c]);
+                  const COLS=["Ticker","Investidor","Classe","Qtd","P. Médio","Vl. Aplicado","Cotação","Var. Dia","Vl. Atual","Rent.","Lucro Real.","Proventos"];
+                  return(
+                    <div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
+                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                        <thead>
+                          <tr style={{background:"rgba(255,255,255,0.06)"}}>
+                            {COLS.map(h=><th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>)}
                           </tr>
-                        );
-                      })}
-                    </tbody>
-                    <tfoot>
-                      <tr style={{borderTop:"1px solid rgba(255,255,255,0.15)",background:"rgba(255,255,255,0.04)"}}>
-                        <td colSpan={7} style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11,fontWeight:500}}>TOTAL</td>
-                        <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(totalPatrim)}</td>
-                        <td style={{padding:"8px 10px",fontWeight:500,color:totalRent>=0?"#86efac":"#fca5a5"}}>{fmtPct(totalRent)}</td>
-                        <td style={{padding:"8px 10px",fontWeight:500,color:(filtA.reduce((s,a)=>s+(a.lucroRealizado||0),0))>=0?"#86efac":"#fca5a5"}}>{fmtBRL(filtA.reduce((s,a)=>s+(a.lucroRealizado||0),0))}</td>
-                        <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(filtA.reduce((s,a)=>s+(a.proventos||0),0))}</td>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
+                        </thead>
+                        <tbody>
+                          {classesOrdenadas.map(classe=>{
+                            const ativos=porClasse[classe];
+                            const expandido=expandedClasses[classe]!==false; // expandido por padrão
+                            const totalAplicado=ativos.reduce((s,a)=>s+toCusto(a,usdBrl),0);
+                            const totalAtual=ativos.reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
+                            const totalRentClasse=totalAplicado>0?(totalAtual-totalAplicado)/totalAplicado*100:0;
+                            const totalLucro=ativos.reduce((s,a)=>s+(a.lucroRealizado||0),0);
+                            const totalProv=ativos.reduce((s,a)=>s+(a.proventos||0),0);
+                            return(
+                              <>
+                              {/* Linha de subtotal da classe */}
+                              <tr key={`class-${classe}`}
+                                onClick={()=>setExpandedClasses(p=>({...p,[classe]:!expandido}))}
+                                style={{background:"rgba(96,165,250,0.08)",borderTop:"1px solid rgba(255,255,255,0.1)",cursor:"pointer",userSelect:"none"}}>
+                                <td colSpan={2} style={{padding:"8px 10px",fontWeight:500,color:"#fff",whiteSpace:"nowrap"}}>
+                                  <i className={`ti ti-chevron-${expandido?"down":"right"}`} style={{fontSize:11,marginRight:6,color:"rgba(255,255,255,0.5)"}}/>
+                                  <span style={{display:"inline-block",width:10,height:10,borderRadius:2,background:COLORS[classe]||"#888",marginRight:6,verticalAlign:"middle"}}></span>
+                                  {classe}
+                                  <span style={{fontSize:10,color:"rgba(255,255,255,0.4)",marginLeft:6}}>{ativos.length} ativo{ativos.length!==1?"s":""}</span>
+                                </td>
+                                <td style={{padding:"8px 10px"}}></td>
+                                <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11}}>—</td>
+                                <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11}}>—</td>
+                                <td style={{padding:"8px 10px",fontWeight:500,color:"rgba(255,255,255,0.85)"}}>{fmtBRL(totalAplicado)}</td>
+                                <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11}}>—</td>
+                                <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11}}>—</td>
+                                <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(totalAtual)}</td>
+                                <td style={{padding:"8px 10px",fontWeight:500,color:totalRentClasse>=0?"#86efac":"#fca5a5"}}>{fmtPct(totalRentClasse)}</td>
+                                <td style={{padding:"8px 10px",fontWeight:500,color:totalLucro>=0?"#86efac":"#fca5a5"}}>{totalLucro!==0?fmtBRL(totalLucro):"—"}</td>
+                                <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(totalProv)}</td>
+                              </tr>
+
+                              {/* Ativos da classe (expandível) */}
+                              {expandido&&ativos.map((a,i)=>{
+                                const rent=toRent(a,usdBrl,indicadores,fatoresAcum);
+                                const valorTotal=toVal(a,usdBrl,indicadores,fatoresAcum);
+                                const valorAplicado=toCusto(a,usdBrl);
+                                const valorAtual=valorTotal/(a.qtd||1);
+                                const lucro=a.lucroRealizado||0;
+                                const isRF=isRendaFixa(a)&&a.indexador;
+                                const temLotes=isRF&&a.lotes&&a.lotes.length>1;
+                                const expandidoLote=expandedRows[a.id];
+                                return(
+                                  <>
+                                  <tr key={a.id}
+                                    style={{borderTop:"1px solid rgba(255,255,255,0.04)",background:i%2===0?"rgba(255,255,255,0.015)":"transparent",cursor:temLotes?"pointer":"default"}}
+                                    onClick={temLotes?()=>setExpandedRows(p=>({...p,[a.id]:!p[a.id]})):undefined}>
+                                    <td style={{padding:"8px 10px 8px 24px",fontWeight:500,color:"#fff"}}>
+                                      {temLotes&&<i className={`ti ti-chevron-${expandidoLote?"down":"right"}`} style={{fontSize:10,marginRight:4,color:"rgba(255,255,255,0.4)"}}/>}
+                                      {a.ticker}
+                                      {isRF&&<span style={{fontSize:9,color:"#fde68a",marginLeft:5,padding:"1px 5px",borderRadius:4,background:"rgba(251,191,36,0.15)"}}>{temLotes?`${a.lotes.length} lotes`:"RF"}</span>}
+                                    </td>
+                                    <td style={{padding:"8px 10px"}}><span style={badge(a.investidor)}>{a.investidor}</span></td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.45)",fontSize:11"}}>
+                                      {isRF&&!temLotes&&(a.indexador==="cdi"?(a.modo_cdi==="percentual"?`${a.taxa}% CDI`:`CDI+${a.taxa}%`):a.indexador==="pre"?`Pré ${a.taxa}%`:`${a.indexador.toUpperCase()}+${a.taxa}%`)}
+                                    </td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{fmt(a.qtd,a.qtd<1?6:2)}</td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{isRF&&temLotes?"—":a.moeda==="USD"?fmtUSD(a.preco_medio):fmtBRL(a.preco_medio)}</td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.75)",fontWeight:500}}>{fmtBRL(valorAplicado)}</td>
+                                    <td style={{padding:"8px 10px",color:"#fff",fontWeight:500}}>{isRF&&temLotes?"—":a.moeda==="USD"?fmtUSD(valorAtual):fmtBRL(valorAtual)}</td>
+                                    <td style={{padding:"8px 10px",color:a.variacao_dia>=0?"#86efac":"#fca5a5",fontSize:11}}>{a.variacao_dia!=null&&!isRF?fmtPct(a.variacao_dia):"—"}</td>
+                                    <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(valorTotal)}</td>
+                                    <td style={{padding:"8px 10px",color:rent>=0?"#86efac":"#fca5a5",fontWeight:500}}>{fmtPct(rent)}</td>
+                                    <td style={{padding:"8px 10px",fontWeight:500,color:lucro>=0?"#86efac":"#fca5a5"}}>{lucro!==0?fmtBRL(lucro):"—"}</td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(a.proventos)}</td>
+                                  </tr>
+                                  {/* Lotes expandidos */}
+                                  {temLotes&&expandidoLote&&a.lotes.map((l,li)=>{
+                                    const vLote=calcValorLote(l,indicadores,fatoresAcum);
+                                    const rentLote=l.valor_inicial>0?(vLote-l.valor_inicial)/l.valor_inicial*100:0;
+                                    const labelTaxa=l.indexador==="cdi"?(l.modo_cdi==="percentual"?`${l.taxa}% CDI`:`CDI+${l.taxa}%`):l.indexador==="pre"?`Pré ${l.taxa}%`:`${l.indexador?.toUpperCase()}+${l.taxa}%`;
+                                    return(
+                                      <tr key={l.id} style={{borderTop:"1px solid rgba(255,255,255,0.03)",background:"rgba(251,191,36,0.04)"}}>
+                                        <td style={{padding:"5px 10px 5px 36px",color:"rgba(255,255,255,0.45)",fontSize:11}}>
+                                          <i className="ti ti-corner-down-right" style={{fontSize:10,marginRight:4,color:"rgba(255,255,255,0.2)"}}/>Lote {li+1}
+                                        </td>
+                                        <td colSpan={2} style={{padding:"5px 10px",color:"#fde68a",fontSize:11}}>{labelTaxa} · {l.data_compra}</td>
+                                        <td style={{padding:"5px 10px",color:"rgba(255,255,255,0.55)",fontSize:11}}>{fmt(l.qtd,l.qtd<1?6:2)}</td>
+                                        <td style={{padding:"5px 10px",color:"rgba(255,255,255,0.45)",fontSize:11}}>{fmtBRL(l.preco_unitario)}</td>
+                                        <td style={{padding:"5px 10px",color:"rgba(255,255,255,0.65)",fontSize:11,fontWeight:500}}>{fmtBRL(l.valor_inicial)}</td>
+                                        <td style={{padding:"5px 10px",color:"rgba(255,255,255,0.45)",fontSize:11}}>{fmtBRL(vLote/l.qtd)}</td>
+                                        <td style={{padding:"5px 10px",fontSize:11,color:"rgba(255,255,255,0.25)"}}>—</td>
+                                        <td style={{padding:"5px 10px",fontWeight:500,color:"rgba(255,255,255,0.8)",fontSize:11}}>{fmtBRL(vLote)}</td>
+                                        <td style={{padding:"5px 10px",color:rentLote>=0?"#86efac":"#fca5a5",fontWeight:500,fontSize:11}}>{fmtPct(rentLote)}</td>
+                                        <td colSpan={2} style={{padding:"5px 10px",color:"rgba(255,255,255,0.3)",fontSize:11}}>{l.vencimento?`Venc: ${l.vencimento}`:"—"}</td>
+                                      </tr>
+                                    );
+                                  })}
+                                  </>
+                                );
+                              })}
+                              </>
+                            );
+                          })}
+                          {/* Linha de total geral */}
+                          <tr style={{borderTop:"2px solid rgba(255,255,255,0.15)",background:"rgba(255,255,255,0.05)"}}>
+                            <td colSpan={3} style={{padding:"9px 10px",fontWeight:500,color:"rgba(255,255,255,0.7)",fontSize:12}}>TOTAL GERAL</td>
+                            <td style={{padding:"9px 10px",color:"rgba(255,255,255,0.4)"}}>—</td>
+                            <td style={{padding:"9px 10px",color:"rgba(255,255,255,0.4)"}}>—</td>
+                            <td style={{padding:"9px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(filtA.reduce((s,a)=>s+toCusto(a,usdBrl),0))}</td>
+                            <td style={{padding:"9px 10px",color:"rgba(255,255,255,0.4)"}}>—</td>
+                            <td style={{padding:"9px 10px",color:"rgba(255,255,255,0.4)"}}>—</td>
+                            <td style={{padding:"9px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(totalPatrim)}</td>
+                            <td style={{padding:"9px 10px",fontWeight:500,color:totalRent>=0?"#86efac":"#fca5a5"}}>{fmtPct(totalRent)}</td>
+                            <td style={{padding:"9px 10px",fontWeight:500,color:(filtA.reduce((s,a)=>s+(a.lucroRealizado||0),0))>=0?"#86efac":"#fca5a5"}}>{fmtBRL(filtA.reduce((s,a)=>s+(a.lucroRealizado||0),0))}</td>
+                            <td style={{padding:"9px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(filtA.reduce((s,a)=>s+(a.proventos||0),0))}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })()
             )}
 
             {/* Posições zeradas */}
