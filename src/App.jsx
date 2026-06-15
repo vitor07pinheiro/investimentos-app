@@ -288,7 +288,14 @@ function AppInner({ onLogout }){
     });
   },[assets,usdBrl,indicadores,fatoresAcum]);
 
-  // ── Detecta fechamento de mês: ao detectar mudança de mês, congela o snapshot anterior ──
+  // ── Quando fatoresAcum atualiza, força recalculo do snapshot do mês vigente ──
+  useEffect(()=>{
+    if(Object.keys(fatoresAcum).length===0) return;
+    const mes = mesAtualKey();
+    const vitor   = assets.filter(a=>a.investidor==="Vitor")  .reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
+    const larissa = assets.filter(a=>a.investidor==="Larissa").reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
+    setSnapshots(prev=>({...prev,[mes]:{vitor,larissa,atualizado:new Date().toISOString()}}));
+  },[fatoresAcum]);
   useEffect(()=>{
     const mesAtual=mesAtualKey();
     const keys=Object.keys(snapshots);
@@ -354,33 +361,24 @@ function AppInner({ onLogout }){
     try{const r=await apiFetch(`${API}/api/indicadores`,{},authFail);const d=await r.json();setIndicadores(d);log(`CDI ${d.cdi_anual}% · Selic ${d.selic}% · IPCA ${d.ipca_mensal}%/mês`,"ok");setApiStatus(s=>({...s,indicadores:"ok"}));}catch(e){log("Indicadores: erro","error");setApiStatus(s=>({...s,indicadores:"error"}));}
 
     // ── Busca fatores IPCA/CDI acumulados para cada ativo de renda fixa ──
-    const rfAtivos = cur.filter(a=>isRendaFixa(a)&&a.indexador&&a.data_compra);
-    if(rfAtivos.length>0){
-      const novos={};
-      for(const a of rfAtivos){
-        try{
-          const reqs=[];
-          if(a.indexador==="ipca") reqs.push(["ipca",apiFetch(`${API}/api/ipca-acumulado?inicio=${a.data_compra}`,{},authFail)]);
-          if(a.indexador==="cdi"||a.indexador==="selic") reqs.push(["cdi",apiFetch(`${API}/api/cdi-acumulado?inicio=${a.data_compra}`,{},authFail)]);
-          const resultados=await Promise.all(reqs.map(([_,p])=>p));
-          const obj={};
-          reqs.forEach(([tipo,_],i)=>{
-            if(resultados[i].ok){
-              resultados[i].json().then(d=>{obj[tipo]=d.fator;});
-            }
-          });
-          // Aguarda parsing
-          for(let i=0;i<reqs.length;i++){
-            if(resultados[i].ok){
-              const d=await resultados[i].clone().json();
-              obj[reqs[i][0]]=d.fator;
-            }
-          }
-          novos[a.id]=obj;
-        }catch(e){}
-      }
-      setFatoresAcum(p=>({...p,...novos}));
-      log(`Renda Fixa: fatores históricos atualizados para ${rfAtivos.length} ativo(s)`,"ok");
+    const rfAtivos = cur.filter(a => isRendaFixa(a) && a.indexador && a.data_compra);
+    if (rfAtivos.length > 0) {
+      const novos = {};
+      await Promise.all(rfAtivos.map(async a => {
+        try {
+          const rota = (a.indexador === "ipca")
+            ? `${API}/api/ipca-acumulado?inicio=${a.data_compra}`
+            : `${API}/api/cdi-acumulado?inicio=${a.data_compra}`;          const r = await apiFetch(rota, {}, authFail);
+          if (!r.ok) return;
+          const d = await r.json();
+          if (!d.fator) return;
+          novos[a.id] = a.indexador === "ipca"
+            ? { ipca: d.fator }
+            : { cdi:  d.fator };
+        } catch(e) { /* ignora erros individuais */ }
+      }));
+      setFatoresAcum(prev => ({ ...prev, ...novos }));
+      log(`Renda Fixa: fatores históricos atualizados para ${Object.keys(novos).length} ativo(s)`, "ok");
     }
     const b3=cur.filter(a=>["Ações B3","FIIs B3"].includes(a.classe));
     if(b3.length>0){try{const tickers=[...new Set(b3.map(a=>a.ticker))].join(",");const r=await apiFetch(`${API}/api/cotacoes/b3?tickers=${tickers}`,{},authFail);const d=await r.json();if(d.cotacoes){setAssets(p=>p.map(a=>{const q=d.cotacoes.find(c=>c.ticker===a.ticker);return q?{...a,preco_atual:q.preco,variacao_dia:q.variacao_dia}:a;}));log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");}}catch(e){log("B3: erro","error");}}
