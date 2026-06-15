@@ -288,14 +288,35 @@ function AppInner({ onLogout }){
     });
   },[assets,usdBrl,indicadores,fatoresAcum]);
 
-  // ── Quando fatoresAcum atualiza, força recalculo do snapshot do mês vigente ──
-  useEffect(()=>{
-    if(Object.keys(fatoresAcum).length===0) return;
-    const mes = mesAtualKey();
-    const vitor   = assets.filter(a=>a.investidor==="Vitor")  .reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
-    const larissa = assets.filter(a=>a.investidor==="Larissa").reduce((s,a)=>s+toVal(a,usdBrl,indicadores,fatoresAcum),0);
-    setSnapshots(prev=>({...prev,[mes]:{vitor,larissa,atualizado:new Date().toISOString()}}));
-  },[fatoresAcum]);
+  // ── Busca fatores acumulados separadamente, usando o estado atual dos ativos ──
+  const buscarFatoresRF = useCallback(async (ativosRF) => {
+    if (!ativosRF || ativosRF.length === 0) return;
+    const novos = {};
+    await Promise.all(ativosRF.map(async a => {
+      try {
+        const rota = a.indexador === "ipca"
+          ? `${API}/api/ipca-acumulado?inicio=${a.data_compra}`
+          : `${API}/api/cdi-acumulado?inicio=${a.data_compra}`;
+        const r = await apiFetch(rota, {});
+        if (!r || !r.ok) return;
+        const d = await r.json();
+        if (!d || !d.fator) return;
+        novos[a.id] = a.indexador === "ipca" ? { ipca: d.fator } : { cdi: d.fator };
+        console.log(`Fator ${a.indexador} para ${a.ticker} (id:${a.id}):`, d.fator);
+      } catch(e) { console.error("Erro fator RF:", a.ticker, e); }
+    }));
+    console.log("Novos fatores:", novos);
+    if (Object.keys(novos).length > 0) {
+      setFatoresAcum(prev => ({ ...prev, ...novos }));
+    }
+    return novos;
+  }, []);
+
+  // ── Dispara busca de fatores toda vez que os ativos de RF mudam ──
+  useEffect(() => {
+    const rfAtivos = assets.filter(a => isRendaFixa(a) && a.indexador && a.data_compra && a.indexador !== "pre");
+    if (rfAtivos.length > 0) buscarFatoresRF(rfAtivos);
+  }, [assets]);
   useEffect(()=>{
     const mesAtual=mesAtualKey();
     const keys=Object.keys(snapshots);
