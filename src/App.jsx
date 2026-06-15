@@ -421,10 +421,39 @@ function AppInner({ onLogout }){
       setFatoresAcum(prev => ({ ...prev, ...novos }));
       log(`Renda Fixa: fatores históricos atualizados para ${Object.keys(novos).length} ativo(s)`, "ok");
     }
-    const b3=cur.filter(a=>["Ações B3","FIIs B3"].includes(a.classe));
-    if(b3.length>0){try{const tickers=[...new Set(b3.map(a=>a.ticker))].join(",");const r=await apiFetch(`${API}/api/cotacoes/b3?tickers=${tickers}`,{},authFail);const d=await r.json();if(d.cotacoes){setAssets(p=>p.map(a=>{const q=d.cotacoes.find(c=>c.ticker===a.ticker);return q?{...a,preco_atual:q.preco,variacao_dia:q.variacao_dia}:a;}));log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");}}catch(e){log("B3: erro","error");}}
-    const eua=cur.filter(a=>["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
-    if(eua.length>0){try{const tickers=[...new Set(eua.map(a=>a.ticker))].join(",");const r=await apiFetch(`${API}/api/cotacoes/eua?tickers=${tickers}`,{},authFail);const d=await r.json();if(d.cotacoes){setAssets(p=>p.map(a=>{const q=d.cotacoes.find(c=>c.ticker===a.ticker);return q?{...a,preco_atual:q.preco_usd,variacao_dia:q.variacao_dia}:a;}));log(`EUA: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");}}catch(e){log("EUA: erro","error");}}
+    // B3
+    const b3 = cur.filter(a=>["Ações B3","FIIs B3"].includes(a.classe));
+    if(b3.length>0){
+      try{
+        const tickers=[...new Set(b3.map(a=>a.ticker))].join(",");
+        const r=await apiFetch(`${API}/api/cotacoes/b3?tickers=${tickers}`,{},authFail);
+        const d=await r.json();
+        if(d.cotacoes){
+          setAssets(prev=>prev.map(a=>{
+            const q=d.cotacoes.find(c=>c.ticker===a.ticker);
+            return q?{...a,preco_atual:q.preco,variacao_dia:q.variacao_dia}:a;
+          }));
+          log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
+        }
+      }catch(e){log("B3: erro","error");}
+    }
+
+    // EUA
+    const eua = cur.filter(a=>["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
+    if(eua.length>0){
+      try{
+        const tickers=[...new Set(eua.map(a=>a.ticker))].join(",");
+        const r=await apiFetch(`${API}/api/cotacoes/eua?tickers=${tickers}`,{},authFail);
+        const d=await r.json();
+        if(d.cotacoes){
+          setAssets(prev=>prev.map(a=>{
+            const q=d.cotacoes.find(c=>c.ticker===a.ticker);
+            return q?{...a,preco_atual:q.preco_usd,variacao_dia:q.variacao_dia}:a;
+          }));
+          log(`EUA: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
+        }
+      }catch(e){log("EUA: erro","error");}
+    }
     try{const r=await apiFetch(`${API}/api/cotacoes/crypto`,{},authFail);const d=await r.json();if(d.bitcoin){setAssets(p=>p.map(a=>a.ticker==="BTC"?{...a,preco_atual:d.bitcoin.preco_brl,variacao_dia:d.bitcoin.variacao_24h}:a));log(`Bitcoin: R$ ${d.bitcoin.preco_brl.toLocaleString("pt-BR")}`,"ok");}}catch(e){log("Bitcoin: erro","error");}
     setApiStatus(s=>({...s,cotacoes:"ok"}));
     const now=new Date().toLocaleString("pt-BR");setLastUpdate(now);log(`Concluído — ${now}`,"ok");
@@ -456,8 +485,12 @@ function AppInner({ onLogout }){
       const prev = posicoes[k] || {
         ticker: op.ticker, nome: op.nome || op.ticker, classe: op.classe, investidor: op.investidor,
         qtd: 0, preco_medio: 0, moeda: op.moeda, lucroRealizado: 0, proventos: cache[k]?.proventos||0,
-        data_compra: op.data, preco_atual: cache[k]?.preco_atual || op.preco, variacao_dia: cache[k]?.variacao_dia,
-        indexador: cache[k]?.indexador, taxa: cache[k]?.taxa, modo_cdi: cache[k]?.modo_cdi, vencimento: cache[k]?.vencimento,
+        data_compra: op.data,
+        // Preserva SEMPRE a cotação atual do cache — nunca sobrescreve com preco da operação
+        preco_atual: cache[k]?.preco_atual ?? op.preco,
+        variacao_dia: cache[k]?.variacao_dia,
+        indexador: cache[k]?.indexador, taxa: cache[k]?.taxa, modo_cdi: cache[k]?.modo_cdi,
+        vencimento: cache[k]?.vencimento, lotes: cache[k]?.lotes,
         id: cache[k]?.id || Date.now()+Math.random(),
       };
       if (op.tipo === "compra") {
@@ -490,6 +523,8 @@ function AppInner({ onLogout }){
     const {ativos, zerados} = reconstruirCarteira(novasOps, assetsRef.current);
     setAssets(ativos);
     setAtivosZerados(zerados);
+    // Força atualização de cotações após reconstrução para garantir preco_atual correto
+    setTimeout(() => atualizarTudo(), 300);
   }
 
   function excluirOperacao(id) {
