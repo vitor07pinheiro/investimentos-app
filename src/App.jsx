@@ -889,7 +889,7 @@ function AppInner({ onLogout }){
                                       {isRF&&<span style={{fontSize:9,color:"#fde68a",marginLeft:5,padding:"1px 5px",borderRadius:4,background:"rgba(251,191,36,0.15)"}}>{temLotes?`${a.lotes.length} lotes`:"RF"}</span>}
                                     </td>
                                     <td style={{padding:"8px 10px"}}><span style={badge(a.investidor)}>{a.investidor}</span></td>
-                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.45)",fontSize:11"}}>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.45)",fontSize:11}}>
                                       {isRF&&!temLotes&&(a.indexador==="cdi"?(a.modo_cdi==="percentual"?`${a.taxa}% CDI`:`CDI+${a.taxa}%`):a.indexador==="pre"?`Pré ${a.taxa}%`:`${a.indexador.toUpperCase()}+${a.taxa}%`)}
                                     </td>
                                     <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{fmt(a.qtd,a.qtd<1?6:2)}</td>
