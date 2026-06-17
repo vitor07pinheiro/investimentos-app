@@ -430,10 +430,13 @@ function AppInner({ onLogout }){
         const d=await r.json();
         if(d.cotacoes){
           setAssets(prev=>prev.map(a=>{
-            const q=d.cotacoes.find(c=>c.ticker===a.ticker);
+            const q=d.cotacoes.find(c=>c.ticker.toUpperCase()===a.ticker.toUpperCase());
+            if(q) console.log(`✓ Atualizando ${a.ticker}: ${a.preco_atual} → ${q.preco}`);
             return q?{...a,preco_atual:q.preco,variacao_dia:q.variacao_dia}:a;
           }));
           log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
+          if(d.nao_encontrados?.length>0)
+            log(`B3: tickers não encontrados na BRAPI: ${d.nao_encontrados.join(", ")}`, "warn");
         }
       }catch(e){log("B3: erro","error");}
     }
@@ -451,6 +454,8 @@ function AppInner({ onLogout }){
             return q?{...a,preco_atual:q.preco_usd,variacao_dia:q.variacao_dia}:a;
           }));
           log(`EUA: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
+          if(d.nao_encontrados?.length>0)
+            log(`EUA: tickers não encontrados: ${d.nao_encontrados.join(", ")}`, "warn");
         }
       }catch(e){log("EUA: erro","error");}
     }
