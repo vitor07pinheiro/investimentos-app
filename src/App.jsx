@@ -105,6 +105,9 @@ const CLASS_GOALS = {
 const GOALS_TOTAL = {Vitor:200000,Larissa:150000};
 const STORAGE_KEY = "inv_app_v4";
 
+function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
+function saveState(s){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch(e){}}
+
 const fmt = (v,d=2) => isNaN(v)?"—":v.toLocaleString("pt-BR",{minimumFractionDigits:d,maximumFractionDigits:d});
 const fmtBRL = v => "R$ "+fmt(v);
 const fmtUSD = v => "US$ "+fmt(v);
@@ -264,7 +267,10 @@ function AppInner({ onLogout }){
   const [goalsClass,setGoalsClass]=useState(saved?.goalsClass||CLASS_GOALS);
   const [editandoMeta,setEditandoMeta]=useState(null);
   const [expandedRows,setExpandedRows]=useState({});
-  const [expandedClasses,setExpandedClasses]=useState({}); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
+  const [expandedClasses,setExpandedClasses]=useState({});
+  const [migracaoDisponivel,setMigracaoDisponivel]=useState(false);
+  const [migrando,setMigrando]=useState(false);
+  const [migracaoMsg,setMigracaoMsg]=useState(""); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
   const [tab,setTab]=useState("dashboard");
   const [investor,setInvestor]=useState("Todos");
   const [usdBrl,setUsdBrl]=useState(5.25);
@@ -290,22 +296,85 @@ function AppInner({ onLogout }){
   // ── Salvar estado ───────────────────────────────────────────────────────────
   // ── Carrega dados do backend ao iniciar ──
   useEffect(()=>{
-    (async()=>{
-      const dados=await carregarDadosBackend();
-      if(dados){
-        setAssets(dados.assets||[]);
-        setProvs(dados.provs||[]);
-        setOperacoes(dados.operacoes||[]);
-        setSnapshots(dados.snapshots||{});
-        setAtivosZerados(dados.ativosZerados||{});
-        if(dados.goalsTotal) setGoalsTotal(dados.goalsTotal);
-        if(dados.goalsClass) setGoalsClass(dados.goalsClass);
-        setFatoresAcum(dados.fatoresAcum||{});
+    let finalizado=false;
+    // Proteção: se o backend demorar mais de 20s (Render acordando), libera o app mesmo assim
+    const timeoutSeguranca=setTimeout(()=>{
+      if(!finalizado){
+        console.warn("Carga inicial excedeu o tempo — liberando app");
+        setCarregando(false);
+        primeiraCarga.current=false;
       }
+    },20000);
+
+    (async()=>{
+      try{
+        const dados=await carregarDadosBackend();
+        if(dados){
+          setAssets(Array.isArray(dados.assets)?dados.assets:[]);
+          setProvs(Array.isArray(dados.provs)?dados.provs:[]);
+          setOperacoes(Array.isArray(dados.operacoes)?dados.operacoes:[]);
+          setSnapshots(dados.snapshots&&typeof dados.snapshots==="object"?dados.snapshots:{});
+          setAtivosZerados(dados.ativosZerados&&typeof dados.ativosZerados==="object"?dados.ativosZerados:{});
+          if(dados.goalsTotal) setGoalsTotal(dados.goalsTotal);
+          if(dados.goalsClass) setGoalsClass(dados.goalsClass);
+          setFatoresAcum(dados.fatoresAcum&&typeof dados.fatoresAcum==="object"?dados.fatoresAcum:{});
+        }
+      }catch(e){
+        console.error("Erro na carga inicial:",e);
+      }
+
+      finalizado=true;
+      clearTimeout(timeoutSeguranca);
       setCarregando(false);
       primeiraCarga.current=false;
+
+      // Verifica dados locais para migração
+      try{
+        const local=JSON.parse(localStorage.getItem(STORAGE_KEY)||"{}");
+        const temDadosLocais=(local.assets&&local.assets.length>0)||(local.operacoes&&local.operacoes.length>0);
+        const dadosBackend=await carregarDadosBackend().catch(()=>null);
+        const backendVazio=!dadosBackend||!dadosBackend.assets||dadosBackend.assets.length===0;
+        if(temDadosLocais&&backendVazio) setMigracaoDisponivel(true);
+      }catch(e){}
     })();
+
+    return ()=>clearTimeout(timeoutSeguranca);
   },[]);
+
+  // ── Migração: envia dados do localStorage para o MongoDB ──
+  async function migrarDadosLocais(){
+    setMigrando(true);setMigracaoMsg("");
+    try{
+      const local=JSON.parse(localStorage.getItem(STORAGE_KEY)||"{}");
+      const dadosMigrar={
+        assets:local.assets||[],
+        provs:local.provs||[],
+        operacoes:local.operacoes||[],
+        snapshots:local.snapshots||{},
+        ativosZerados:local.ativosZerados||{},
+        goalsTotal:local.goalsTotal||{Vitor:200000,Larissa:150000},
+        goalsClass:local.goalsClass||CLASS_GOALS,
+        fatoresAcum:local.fatoresAcum||{},
+      };
+      const ok=await salvarDadosBackend(dadosMigrar);
+      if(ok){
+        // Aplica no estado atual
+        setAssets(dadosMigrar.assets);
+        setProvs(dadosMigrar.provs);
+        setOperacoes(dadosMigrar.operacoes);
+        setSnapshots(dadosMigrar.snapshots);
+        setAtivosZerados(dadosMigrar.ativosZerados);
+        setGoalsTotal(dadosMigrar.goalsTotal);
+        setGoalsClass(dadosMigrar.goalsClass);
+        setFatoresAcum(dadosMigrar.fatoresAcum);
+        setMigracaoMsg(`✓ ${dadosMigrar.assets.length} ativos e ${dadosMigrar.operacoes.length} operações migrados com sucesso!`);
+        setTimeout(()=>{setMigracaoDisponivel(false);setMigracaoMsg("");},4000);
+      }else{
+        setMigracaoMsg("Erro ao migrar. Tente novamente.");
+      }
+    }catch(e){setMigracaoMsg("Erro ao ler dados locais.");}
+    setMigrando(false);
+  }
 
   // ── Salva no backend com debounce sempre que dados mudam ──
   useEffect(()=>{
@@ -794,6 +863,27 @@ function AppInner({ onLogout }){
         ))}
       </div>
       <div style={{margin:"0 1.25rem",borderTop:"1px solid rgba(255,255,255,0.12)"}}></div>
+
+      {/* Banner de migração de dados locais */}
+      {migracaoDisponivel&&(
+        <div style={{margin:"1rem 1.25rem 0",padding:"1rem 1.25rem",borderRadius:12,background:"rgba(251,191,36,0.1)",border:"1px solid rgba(251,191,36,0.3)",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <i className="ti ti-database-import" style={{fontSize:22,color:"#fde68a"}}/>
+            <div>
+              <p style={{fontWeight:500,fontSize:13,margin:0,color:"#fff"}}>Dados locais encontrados neste navegador</p>
+              <p style={{fontSize:11,color:"rgba(255,255,255,0.6)",margin:"2px 0 0"}}>
+                {migracaoMsg||"Migre-os para a nuvem para acessar de qualquer dispositivo e compartilhar com outras pessoas."}
+              </p>
+            </div>
+          </div>
+          {!migracaoMsg&&(
+            <button onClick={migrarDadosLocais} disabled={migrando} style={{padding:"8px 16px",fontSize:13,fontWeight:500,borderRadius:8,border:"none",background:migrando?"rgba(251,191,36,0.2)":"rgba(251,191,36,0.35)",color:"#fff",cursor:migrando?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap"}}>
+              <i className={`ti ${migrando?"ti-loader spin":"ti-cloud-upload"}`} style={{fontSize:14}}/>
+              {migrando?"Migrando...":"Migrar para a nuvem"}
+            </button>
+          )}
+        </div>
+      )}
 
       <div style={{padding:"1rem 1.25rem"}}>
 
