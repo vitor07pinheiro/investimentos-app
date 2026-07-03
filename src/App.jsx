@@ -263,15 +263,14 @@ function AppInner({ onLogout }){
   const [goalsTotal,setGoalsTotal]=useState(saved?.goalsTotal||{Vitor:200000,Larissa:150000});
   const [goalsClass,setGoalsClass]=useState(saved?.goalsClass||CLASS_GOALS);
   const [editandoMeta,setEditandoMeta]=useState(null);
-  const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{});
   const [expandedRows,setExpandedRows]=useState({});
   const [expandedClasses,setExpandedClasses]=useState({}); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
   const [tab,setTab]=useState("dashboard");
   const [investor,setInvestor]=useState("Todos");
-  const [usdBrl,setUsdBrl]=useState(saved?.usdBrl||5.25);
-  const [indicadores,setIndicadores]=useState(saved?.indicadores||null);
+  const [usdBrl,setUsdBrl]=useState(5.25);
+  const [indicadores,setIndicadores]=useState(null);
   const [apiStatus,setApiStatus]=useState({cotacoes:"idle",cambio:"idle",indicadores:"idle"});
-  const [lastUpdate,setLastUpdate]=useState(saved?.lastUpdate||null);
+  const [lastUpdate,setLastUpdate]=useState(null);
   const [subTab,setSubTab]=useState("op");
   const [form,setForm]=useState({tipo:"compra",ticker:"",nome:"",classe:"Ações B3",investidor:"Vitor",qtd:"",preco:"",data:new Date().toISOString().split("T")[0],moeda:"BRL",indexador:"pre",taxa:"",modo_cdi:"percentual",vencimento:""});
   const [pForm,setPForm]=useState({ticker:"",tipo:"Dividendo",valor:"",data:new Date().toISOString().split("T")[0],investidor:"Vitor",moeda:"BRL"});
@@ -289,7 +288,36 @@ function AppInner({ onLogout }){
   useEffect(()=>{assetsRef.current=assets;},[assets]);
 
   // ── Salvar estado ───────────────────────────────────────────────────────────
-  useEffect(()=>{saveState({assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass,fatoresAcum});},[assets,provs,operacoes,snapshots,ativosZerados,usdBrl,indicadores,lastUpdate,goalsTotal,goalsClass,fatoresAcum]);
+  // ── Carrega dados do backend ao iniciar ──
+  useEffect(()=>{
+    (async()=>{
+      const dados=await carregarDadosBackend();
+      if(dados){
+        setAssets(dados.assets||[]);
+        setProvs(dados.provs||[]);
+        setOperacoes(dados.operacoes||[]);
+        setSnapshots(dados.snapshots||{});
+        setAtivosZerados(dados.ativosZerados||{});
+        if(dados.goalsTotal) setGoalsTotal(dados.goalsTotal);
+        if(dados.goalsClass) setGoalsClass(dados.goalsClass);
+        setFatoresAcum(dados.fatoresAcum||{});
+      }
+      setCarregando(false);
+      primeiraCarga.current=false;
+    })();
+  },[]);
+
+  // ── Salva no backend com debounce sempre que dados mudam ──
+  useEffect(()=>{
+    if(primeiraCarga.current||carregando) return;
+    if(saveTimeout.current) clearTimeout(saveTimeout.current);
+    saveTimeout.current=setTimeout(async()=>{
+      setSalvandoBackend(true);
+      await salvarDadosBackend({assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum});
+      setSalvandoBackend(false);
+    },1500);
+    return ()=>{ if(saveTimeout.current) clearTimeout(saveTimeout.current); };
+  },[assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum,carregando]);
 
   // ── Snapshot mensal dinâmico: atualiza o mês vigente sempre que ativos ou câmbio mudam ──
   // Snapshots de meses anteriores ficam imutáveis (criados quando o mês fecha ou via carga histórica)
@@ -709,6 +737,16 @@ function AppInner({ onLogout }){
     {id:"apilog",icon:"ti-terminal",label:"API"},
   ];
 
+  if(carregando) return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#0f2a5c,#4b99c9)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{textAlign:"center"}}>
+        <i className="ti ti-loader spin" style={{fontSize:32,color:"#93c5fd"}}/>
+        <p style={{color:"rgba(255,255,255,0.6)",marginTop:12,fontSize:13}}>Carregando seus investimentos...</p>
+      </div>
+      <style>{`.spin{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+
   return(
     <div style={{minHeight:"100vh",paddingBottom:"2rem"}}>
       <style>{`.spin{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
@@ -737,6 +775,10 @@ function AppInner({ onLogout }){
               {inv}
             </button>
           ))}
+          <span title={salvandoBackend?"Salvando na nuvem...":"Dados sincronizados"} style={{display:"inline-flex",alignItems:"center",gap:4,padding:"5px 10px",borderRadius:20,background:salvandoBackend?"rgba(251,191,36,0.15)":"rgba(52,211,153,0.15)",color:salvandoBackend?"#fde68a":"#6ee7b7",fontSize:11,fontWeight:500}}>
+            <i className={`ti ${salvandoBackend?"ti-cloud-upload spin":"ti-cloud-check"}`} style={{fontSize:13}}/>
+            {salvandoBackend?"Salvando":"Sincronizado"}
+          </span>
           <button onClick={()=>onLogout()} title="Sair" style={{padding:"5px 10px",fontSize:12,borderRadius:20,border:"1px solid rgba(248,113,113,0.3)",background:"rgba(248,113,113,0.1)",color:"#fca5a5",cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>
             <i className="ti ti-logout" style={{fontSize:13}}/>Sair
           </button>
