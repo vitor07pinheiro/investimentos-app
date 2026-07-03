@@ -205,8 +205,6 @@ const ultimosMeses = (n) => {
   return arr;
 };
 
-function loadState(){try{const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);}catch(e){}return null;}
-function saveState(s){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch(e){}}
 function toVal(a,r=5.25,ind=null,fatAcum=null){
   if(isRendaFixa(a)&&a.indexador){
     // Se tem lotes, soma valor presente de cada lote individualmente
@@ -285,6 +283,10 @@ function AppInner({ onLogout }){
   const [opFiltro,setOpFiltro]=useState({investidor:"Todos",tipo:"Todos",ticker:""});
   const [editOp,setEditOp]=useState(null); // operação sendo editada
   const [confirmDelete,setConfirmDelete]=useState(null); // id da operação a excluir
+  // ── Estados da persistência no MongoDB ──
+  const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{}); // { [ativo_id]: { cdi?, ipca? } }
+  const [carregando,setCarregando]=useState(true);                     // carga inicial do backend em andamento
+  const [salvandoBackend,setSalvandoBackend]=useState(false);          // indicador "Salvando na nuvem"
 
   const dashChartRef=useRef(null);const dashChartInst=useRef(null);
   const chartRef=useRef(null);const chartInst=useRef(null);
@@ -292,6 +294,30 @@ function AppInner({ onLogout }){
   const lucroChartRef=useRef(null);const lucroChartInst=useRef(null);
   const assetsRef=useRef(assets);
   useEffect(()=>{assetsRef.current=assets;},[assets]);
+
+  // Refs de controle da sincronização com o backend
+  const primeiraCarga=useRef(true);  // trava o auto-save até a carga inicial terminar
+  const saveTimeout=useRef(null);    // debounce do salvamento no backend
+
+  // ── Persistência no MongoDB (via backend Express) ──────────────────────────
+  // GET  /api/dados  → retorna o documento salvo (portfolio_familiar) ou defaults
+  // PUT  /api/dados  → grava (upsert) o documento completo
+  async function carregarDadosBackend(){
+    const r=await apiFetch(`${API}/api/dados`,{},onLogout);
+    if(!r.ok) return null;
+    const d=await r.json();
+    return (d&&typeof d==="object")?d:null;
+  }
+  async function salvarDadosBackend(dados){
+    try{
+      const r=await apiFetch(`${API}/api/dados`,{
+        method:"PUT",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(dados),
+      },onLogout);
+      return r.ok;
+    }catch(e){ return false; }
+  }
 
   // ── Salvar estado ───────────────────────────────────────────────────────────
   // ── Carrega dados do backend ao iniciar ──
