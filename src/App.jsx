@@ -283,6 +283,8 @@ function AppInner({ onLogout }){
   const [opFiltro,setOpFiltro]=useState({investidor:"Todos",tipo:"Todos",ticker:""});
   const [editOp,setEditOp]=useState(null); // operação sendo editada
   const [confirmDelete,setConfirmDelete]=useState(null); // id da operação a excluir
+  const [editProv,setEditProv]=useState(null); // provento sendo editado
+  const [confirmDeleteProv,setConfirmDeleteProv]=useState(null); // id do provento a excluir
   // ── Estados da persistência no MongoDB ──
   const [fatoresAcum,setFatoresAcum]=useState(saved?.fatoresAcum||{}); // { [ativo_id]: { cdi?, ipca? } }
   const [carregando,setCarregando]=useState(true);                     // carga inicial do backend em andamento
@@ -294,6 +296,8 @@ function AppInner({ onLogout }){
   const lucroChartRef=useRef(null);const lucroChartInst=useRef(null);
   const assetsRef=useRef(assets);
   useEffect(()=>{assetsRef.current=assets;},[assets]);
+  const provsRef=useRef(provs);
+  useEffect(()=>{provsRef.current=provs;},[provs]);
 
   // Refs de controle da sincronização com o backend
   const primeiraCarga=useRef(true);  // trava o auto-save até a carga inicial terminar
@@ -564,6 +568,41 @@ function AppInner({ onLogout }){
       }catch(e){log("B3: erro","error");}
     }
 
+    // Proventos B3 (conecta rota já existente no backend: /api/proventos/:ticker)
+    if(b3.length>0){
+      try{
+        const tickersUnicos=[...new Set(b3.map(a=>a.ticker))];
+        const novosProventos=[];
+        await Promise.all(tickersUnicos.map(async ticker=>{
+          try{
+            const r=await apiFetch(`${API}/api/proventos/${ticker}`,{},authFail);
+            const d=await r.json();
+            if(!d.proventos)return;
+            d.proventos.forEach(p=>{
+              if(!p.data_pagamento||!p.valor)return;
+              // Para cada investidor que possui esse ticker, lança o provento (se ainda não importado)
+              b3.filter(a=>a.ticker===ticker).forEach(a=>{
+                const jaExiste=provsRef.current.some(ex=>ex.origem==="brapi"&&ex.ticker===ticker&&ex.investidor===a.investidor&&ex.data===p.data_pagamento);
+                if(jaExiste)return;
+                const valorTotal=parseFloat(p.valor)*a.qtd;
+                if(!valorTotal)return;
+                const isJCP=(p.tipo||"").toUpperCase().includes("JRS")||(p.tipo||"").toUpperCase().includes("JCP");
+                novosProventos.push({id:Date.now()+Math.random(),ticker,investidor:a.investidor,tipo:isJCP?"JCP":"Dividendo",valor:valorTotal,moeda:"BRL",data:p.data_pagamento,origem:"brapi"});
+              });
+            });
+          }catch(e){/* ignora erro individual de ticker */}
+        }));
+        if(novosProventos.length>0){
+          setProvs(p=>[...novosProventos,...p]);
+          setAssets(prev=>prev.map(a=>{
+            const add=novosProventos.filter(np=>np.ticker===a.ticker&&np.investidor===a.investidor).reduce((s,np)=>s+np.valor,0);
+            return add>0?{...a,proventos:(a.proventos||0)+add}:a;
+          }));
+          log(`Proventos BRAPI: ${novosProventos.length} novo(s) lançamento(s) importado(s)`,"ok");
+        }
+      }catch(e){log("Proventos BRAPI: erro","error");}
+    }
+
     // EUA
     const eua = cur.filter(a=>["Ações EUA","Real Estate EUA","Renda Fixa EUA"].includes(a.classe));
     if(eua.length>0){
@@ -786,10 +825,57 @@ function AppInner({ onLogout }){
     },400);
   }
 
+  // Ajusta o campo "proventos" de um ativo específico (delta pode ser positivo ou negativo)
+  function ajustarProventoAtivo(ticker,investidor,deltaBRL){
+    if(!deltaBRL)return;
+    setAssets(prev=>prev.map(a=>a.ticker===ticker&&a.investidor===investidor?{...a,proventos:(a.proventos||0)+deltaBRL}:a));
+  }
+
+  function salvarEdicaoProv(provEditado){
+    const antigo=provs.find(p=>p.id===provEditado.id);
+    if(!antigo)return;
+    const valorNovo=parseFloat(provEditado.valor);
+    const ticker=provEditado.ticker.toUpperCase();
+    const valorAntigoBRL=antigo.moeda==="USD"?antigo.valor*usdBrl:antigo.valor;
+    const valorNovoBRL=provEditado.moeda==="USD"?valorNovo*usdBrl:valorNovo;
+    // Reverte o valor antigo do ativo/investidor original
+    ajustarProventoAtivo(antigo.ticker,antigo.investidor,-valorAntigoBRL);
+    // Aplica o valor novo no ativo/investidor (pode ter mudado)
+    ajustarProventoAtivo(ticker,provEditado.investidor,valorNovoBRL);
+    setProvs(p=>p.map(pr=>pr.id===provEditado.id?{...provEditado,ticker,valor:valorNovo}:pr));
+    setEditProv(null);
+  }
+
+  function excluirProvento(id){
+    const p=provs.find(pr=>pr.id===id);
+    if(p){
+      const valorBRL=p.moeda==="USD"?p.valor*usdBrl:p.valor;
+      ajustarProventoAtivo(p.ticker,p.investidor,-valorBRL);
+    }
+    setProvs(prev=>prev.filter(pr=>pr.id!==id));
+    setConfirmDeleteProv(null);
+  }
+
   function handleProv(){
     if(!pForm.ticker||!pForm.valor)return;
     setSaving(true);
-    setTimeout(()=>{setProvs(p=>[{id:Date.now(),...pForm,valor:parseFloat(pForm.valor)},...p]);setPForm(f=>({...f,ticker:"",valor:""}));setSaving(false);},400);
+    setTimeout(()=>{
+      const ticker=pForm.ticker.toUpperCase();
+      const valorProvento=parseFloat(pForm.valor);
+      const valorBRL=pForm.moeda==="USD"?valorProvento*usdBrl:valorProvento;
+      setProvs(p=>[{id:Date.now(),...pForm,ticker,valor:valorProvento,origem:"manual"},...p]);
+      // Reflete o provento no campo "proventos" do ativo correspondente (aba Carteira)
+      setAssets(prev=>{
+        const existe=prev.some(a=>a.ticker===ticker&&a.investidor===pForm.investidor);
+        if(!existe){
+          log(`Provento registrado, mas nenhum ativo ${ticker} (${pForm.investidor}) encontrado na carteira — não refletido na aba Carteira.`,"warn");
+          return prev;
+        }
+        return prev.map(a=>a.ticker===ticker&&a.investidor===pForm.investidor?{...a,proventos:(a.proventos||0)+valorBRL}:a);
+      });
+      setPForm(f=>({...f,ticker:"",valor:""}));
+      setSaving(false);
+    },400);
   }
 
   // ── Charts ──────────────────────────────────────────────────────────────────
@@ -1047,7 +1133,7 @@ function AppInner({ onLogout }){
                   });
                   // Ordena classes pela ordem de CLASSES
                   const classesOrdenadas=CLASSES.filter(c=>porClasse[c]);
-                  const COLS=["Ticker","Investidor","Classe","Qtd","P. Médio","Vl. Aplicado","Cotação","Var. Dia","Vl. Atual","Rent.","Lucro Real.","Proventos"];
+                  const COLS=["Ticker","Investidor","Classe","Qtd","P. Médio","Vl. Aplicado","Cotação","Var. Dia","Vl. Atual","Rent.","Lucro Aberto","Lucro Real.","Proventos"];
                   return(
                     <div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
                       <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
@@ -1085,6 +1171,7 @@ function AppInner({ onLogout }){
                                 <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.5)",fontSize:11}}>—</td>
                                 <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(totalAtual)}</td>
                                 <td style={{padding:"8px 10px",fontWeight:500,color:totalRentClasse>=0?"#86efac":"#fca5a5"}}>{fmtPct(totalRentClasse)}</td>
+                                <td style={{padding:"8px 10px",fontWeight:500,color:(totalAtual-totalAplicado)>=0?"#86efac":"#fca5a5"}}>{fmtBRL(totalAtual-totalAplicado)}</td>
                                 <td style={{padding:"8px 10px",fontWeight:500,color:totalLucro>=0?"#86efac":"#fca5a5"}}>{totalLucro!==0?fmtBRL(totalLucro):"—"}</td>
                                 <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(totalProv)}</td>
                               </tr>
@@ -1123,6 +1210,7 @@ function AppInner({ onLogout }){
                                     <td style={{padding:"8px 10px",color:a.variacao_dia>=0?"#86efac":"#fca5a5",fontSize:11}}>{a.variacao_dia!=null&&!isRF?fmtPct(a.variacao_dia):"—"}</td>
                                     <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{fmtBRL(valorTotal)}</td>
                                     <td style={{padding:"8px 10px",color:rent>=0?"#86efac":"#fca5a5",fontWeight:500}}>{fmtPct(rent)}</td>
+                                    <td style={{padding:"8px 10px",fontWeight:500,color:(valorTotal-valorAplicado)>=0?"#86efac":"#fca5a5"}}>{fmtBRL(valorTotal-valorAplicado)}</td>
                                     <td style={{padding:"8px 10px",fontWeight:500,color:lucro>=0?"#86efac":"#fca5a5"}}>{lucro!==0?fmtBRL(lucro):"—"}</td>
                                     <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{fmtBRL(a.proventos)}</td>
                                   </tr>
@@ -1144,6 +1232,7 @@ function AppInner({ onLogout }){
                                         <td style={{padding:"5px 10px",fontSize:11,color:"rgba(255,255,255,0.25)"}}>—</td>
                                         <td style={{padding:"5px 10px",fontWeight:500,color:"rgba(255,255,255,0.8)",fontSize:11}}>{fmtBRL(vLote)}</td>
                                         <td style={{padding:"5px 10px",color:rentLote>=0?"#86efac":"#fca5a5",fontWeight:500,fontSize:11}}>{fmtPct(rentLote)}</td>
+                                        <td style={{padding:"5px 10px",color:(vLote-l.valor_inicial)>=0?"#86efac":"#fca5a5",fontWeight:500,fontSize:11}}>{fmtBRL(vLote-l.valor_inicial)}</td>
                                         <td colSpan={2} style={{padding:"5px 10px",color:"rgba(255,255,255,0.3)",fontSize:11}}>{l.vencimento?`Venc: ${l.vencimento}`:"—"}</td>
                                       </tr>
                                     );
@@ -1469,7 +1558,7 @@ function AppInner({ onLogout }){
               ?<div style={{...glass,textAlign:"center",padding:"2rem"}}><i className="ti ti-cash" style={{fontSize:32,color:"rgba(255,255,255,0.3)"}}/><p style={{color:"rgba(255,255,255,0.4)",margin:"8px 0 0",fontSize:13}}>Nenhum provento registrado ainda.</p></div>
               :<div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
                 <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                  <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Data","Ticker","Investidor","Tipo","Valor","Em R$"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500}}>{h}</th>))}</tr></thead>
+                  <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Data","Ticker","Investidor","Tipo","Origem","Valor","Em R$","Ações"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500}}>{h}</th>))}</tr></thead>
                   <tbody>
                     {filtP.sort((a,b)=>b.data.localeCompare(a.data)).map((p,i)=>(
                       <tr key={p.id} style={{borderTop:"1px solid rgba(255,255,255,0.06)",background:i%2===0?"rgba(255,255,255,0.02)":"transparent"}}>
@@ -1477,14 +1566,85 @@ function AppInner({ onLogout }){
                         <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{p.ticker}</td>
                         <td style={{padding:"8px 10px"}}><span style={badge(p.investidor)}>{p.investidor}</span></td>
                         <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.75)"}}>{p.tipo}</td>
+                        <td style={{padding:"8px 10px",fontSize:10,color:p.origem==="brapi"?"#93c5fd":"rgba(255,255,255,0.4)"}}>{p.origem==="brapi"?"BRAPI":"Manual"}</td>
                         <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{p.moeda==="USD"?fmtUSD(p.valor):fmtBRL(p.valor)}</td>
                         <td style={{padding:"8px 10px",color:"#86efac",fontWeight:500}}>{fmtBRL(p.moeda==="USD"?p.valor*usdBrl:p.valor)}</td>
+                        <td style={{padding:"8px 10px",whiteSpace:"nowrap"}}>
+                          <button onClick={()=>setEditProv({...p})} title="Editar" style={{padding:"3px 7px",fontSize:11,borderRadius:6,border:"1px solid rgba(96,165,250,0.3)",background:"rgba(96,165,250,0.15)",color:"#93c5fd",cursor:"pointer",marginRight:4}}>
+                            <i className="ti ti-edit" style={{fontSize:11}}/>
+                          </button>
+                          <button onClick={()=>setConfirmDeleteProv(p.id)} title="Excluir" style={{padding:"3px 7px",fontSize:11,borderRadius:6,border:"1px solid rgba(248,113,113,0.3)",background:"rgba(248,113,113,0.15)",color:"#fca5a5",cursor:"pointer"}}>
+                            <i className="ti ti-trash" style={{fontSize:11}}/>
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             }
+
+            {/* Modal de edição de provento */}
+            {editProv&&(
+              <div onClick={()=>setEditProv(null)} style={{position:"fixed",inset:0,background:"rgba(0,10,30,0.7)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:"1rem"}}>
+                <div onClick={e=>e.stopPropagation()} style={{...glass,width:"100%",maxWidth:460}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                    <p style={{fontWeight:500,fontSize:14,margin:0,color:"#fff"}}>Editar provento</p>
+                    <button onClick={()=>setEditProv(null)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.5)",cursor:"pointer",padding:4}}>
+                      <i className="ti ti-x" style={{fontSize:18}}/>
+                    </button>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                    {[
+                      {l:"Investidor",e:<select value={editProv.investidor} onChange={e=>setEditProv({...editProv,investidor:e.target.value})}><option>Vitor</option><option>Larissa</option></select>},
+                      {l:"Ticker",e:<input value={editProv.ticker} onChange={e=>setEditProv({...editProv,ticker:e.target.value.toUpperCase()})}/>},
+                      {l:"Tipo",e:<select value={editProv.tipo} onChange={e=>setEditProv({...editProv,tipo:e.target.value})}><option>Dividendo</option><option>JCP</option><option>Rendimento</option></select>},
+                      {l:"Valor",e:<input type="number" value={editProv.valor} onChange={e=>setEditProv({...editProv,valor:e.target.value})}/>},
+                      {l:"Moeda",e:<select value={editProv.moeda} onChange={e=>setEditProv({...editProv,moeda:e.target.value})}><option value="BRL">BRL (R$)</option><option value="USD">USD (US$)</option></select>},
+                      {l:"Data",e:<input type="date" value={editProv.data} onChange={e=>setEditProv({...editProv,data:e.target.value})}/>},
+                    ].map(({l,e})=>(<div key={l}><label style={{fontSize:12,color:"rgba(255,255,255,0.6)",display:"block",marginBottom:4}}>{l}</label>{e}</div>))}
+                  </div>
+                  <div style={{display:"flex",gap:8,marginTop:18}}>
+                    <button onClick={()=>setEditProv(null)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.7)",cursor:"pointer"}}>Cancelar</button>
+                    <button onClick={()=>salvarEdicaoProv(editProv)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"none",background:"rgba(96,165,250,0.5)",color:"#fff",cursor:"pointer"}}>
+                      <i className="ti ti-check" style={{fontSize:13,marginRight:4}}/>Salvar
+                    </button>
+                  </div>
+                  <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"12px 0 0",textAlign:"center"}}>
+                    <i className="ti ti-info-circle" style={{fontSize:11,marginRight:3}}/>O total de proventos na aba Carteira será ajustado automaticamente.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Modal de confirmação de exclusão de provento */}
+            {confirmDeleteProv!==null&&(()=>{
+              const p=provs.find(pr=>pr.id===confirmDeleteProv);
+              if(!p)return null;
+              return(
+                <div onClick={()=>setConfirmDeleteProv(null)} style={{position:"fixed",inset:0,background:"rgba(0,10,30,0.7)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:"1rem"}}>
+                  <div onClick={e=>e.stopPropagation()} style={{background:"linear-gradient(160deg,#1a3a7c,#2563a8)",border:"1px solid rgba(248,113,113,0.3)",borderRadius:16,padding:"1.5rem",width:"100%",maxWidth:380,textAlign:"center"}}>
+                    <div style={{width:48,height:48,borderRadius:"50%",background:"rgba(248,113,113,0.2)",display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px"}}>
+                      <i className="ti ti-trash" style={{fontSize:22,color:"#fca5a5"}}/>
+                    </div>
+                    <p style={{fontWeight:500,fontSize:15,margin:"0 0 8px",color:"#fff"}}>Excluir provento?</p>
+                    <p style={{fontSize:12,color:"rgba(255,255,255,0.6)",margin:"0 0 4px"}}>
+                      <strong>{p.ticker}</strong> · {p.tipo} · {p.moeda==="USD"?fmtUSD(p.valor):fmtBRL(p.valor)}
+                    </p>
+                    <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"0 0 16px"}}>{p.data} · {p.investidor}</p>
+                    <p style={{fontSize:11,color:"#fde68a",margin:"0 0 16px",padding:"8px",borderRadius:6,background:"rgba(251,191,36,0.1)",border:"1px solid rgba(251,191,36,0.2)"}}>
+                      <i className="ti ti-alert-triangle" style={{fontSize:11,marginRight:4}}/>O valor será descontado do total de proventos do ativo na aba Carteira.
+                    </p>
+                    <div style={{display:"flex",gap:8}}>
+                      <button onClick={()=>setConfirmDeleteProv(null)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(255,255,255,0.06)",color:"rgba(255,255,255,0.7)",cursor:"pointer"}}>Cancelar</button>
+                      <button onClick={()=>excluirProvento(confirmDeleteProv)} style={{flex:1,padding:"9px",fontSize:13,fontWeight:500,borderRadius:8,border:"none",background:"rgba(248,113,113,0.5)",color:"#fff",cursor:"pointer"}}>
+                        <i className="ti ti-trash" style={{fontSize:13,marginRight:4}}/>Excluir
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
