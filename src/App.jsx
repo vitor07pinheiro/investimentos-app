@@ -276,7 +276,7 @@ function AppInner({ onLogout }){
   const [apiStatus,setApiStatus]=useState({cotacoes:"idle",cambio:"idle",indicadores:"idle"});
   const [lastUpdate,setLastUpdate]=useState(null);
   const [subTab,setSubTab]=useState("op");
-  const [form,setForm]=useState({tipo:"compra",ticker:"",nome:"",classe:"Ações B3",investidor:"Vitor",qtd:"",preco:"",data:new Date().toISOString().split("T")[0],moeda:"BRL",indexador:"pre",taxa:"",modo_cdi:"percentual",vencimento:""});
+  const [form,setForm]=useState({tipo:"compra",ticker:"",nome:"",classe:"Ações B3",investidor:"Vitor",qtd:"",preco:"",data:new Date().toISOString().split("T")[0],moeda:"BRL",indexador:"pre",taxa:"",modo_cdi:"percentual",vencimento:"",ptax:""});
   const [pForm,setPForm]=useState({ticker:"",tipo:"Dividendo",valor:"",data:new Date().toISOString().split("T")[0],investidor:"Vitor",moeda:"BRL"});
   const [saving,setSaving]=useState(false);
   const [apiLog,setApiLog]=useState([]);
@@ -612,7 +612,8 @@ function AppInner({ onLogout }){
       const k = `${op.ticker}_${op.investidor}`;
       const prev = posicoes[k] || {
         ticker: op.ticker, nome: op.nome || op.ticker, classe: op.classe, investidor: op.investidor,
-        qtd: 0, preco_medio: 0, moeda: op.moeda, lucroRealizado: 0, proventos: cache[k]?.proventos||0,
+        qtd: 0, preco_medio: 0, ptax_medio: op.moeda==="USD"?(op.ptax||usdBrl):null, moeda: op.moeda,
+        lucroRealizado: 0, lucroAtivoRealizado: 0, lucroCambioRealizado: 0, proventos: cache[k]?.proventos||0,
         data_compra: op.data,
         // Preserva SEMPRE a cotação atual do cache — nunca sobrescreve com preco da operação
         preco_atual: cache[k]?.preco_atual ?? op.preco,
@@ -624,21 +625,30 @@ function AppInner({ onLogout }){
       if (op.tipo === "compra") {
         const novaQtd = prev.qtd + op.qtd;
         const novoMed = novaQtd>0 ? (prev.qtd*prev.preco_medio + op.qtd*op.preco)/novaQtd : op.preco;
-        posicoes[k] = {...prev, qtd:novaQtd, preco_medio:novoMed};
+        const ptaxOp = op.moeda==="USD" ? (op.ptax||usdBrl) : null;
+        const novoPtaxMedio = op.moeda==="USD" ? (novaQtd>0 ? (prev.qtd*(prev.ptax_medio||usdBrl) + op.qtd*ptaxOp)/novaQtd : ptaxOp) : prev.ptax_medio;
+        posicoes[k] = {...prev, qtd:novaQtd, preco_medio:novoMed, ptax_medio:novoPtaxMedio};
       } else {
-        const lucro = (op.preco - prev.preco_medio) * op.qtd * (op.moeda==="USD" ? usdBrl : 1);
+        const isUSD = op.moeda==="USD";
+        const ptaxCompra = isUSD ? (prev.ptax_medio||usdBrl) : 1;
+        const ptaxVenda = isUSD ? (op.ptax||usdBrl) : 1;
+        const lucroAtivo = (op.preco - prev.preco_medio) * op.qtd * ptaxCompra;
+        const lucroCambio = isUSD ? op.preco * op.qtd * (ptaxVenda - ptaxCompra) : 0;
+        const lucro = lucroAtivo + lucroCambio;
         const novaQtd = prev.qtd - op.qtd;
         if (novaQtd <= 0.0001) {
           // posição zerada
           zerados[k] = {
             ticker:prev.ticker, nome:prev.nome, classe:prev.classe, investidor:prev.investidor,
-            preco_medio: prev.preco_medio,
+            preco_medio: prev.preco_medio, ptax_medio: prev.ptax_medio,
             lucroRealizado: (zerados[k]?.lucroRealizado || 0) + prev.lucroRealizado + lucro,
-            vendas: [...(zerados[k]?.vendas || []), {data:op.data, qtd:op.qtd, preco:op.preco, lucro}],
+            lucroAtivoRealizado: (zerados[k]?.lucroAtivoRealizado || 0) + (prev.lucroAtivoRealizado||0) + lucroAtivo,
+            lucroCambioRealizado: (zerados[k]?.lucroCambioRealizado || 0) + (prev.lucroCambioRealizado||0) + lucroCambio,
+            vendas: [...(zerados[k]?.vendas || []), {data:op.data, qtd:op.qtd, preco:op.preco, ptax:isUSD?ptaxVenda:null, lucro, lucroAtivo, lucroCambio}],
           };
           delete posicoes[k];
         } else {
-          posicoes[k] = {...prev, qtd:novaQtd, lucroRealizado:prev.lucroRealizado + lucro};
+          posicoes[k] = {...prev, qtd:novaQtd, lucroRealizado:prev.lucroRealizado + lucro, lucroAtivoRealizado:(prev.lucroAtivoRealizado||0)+lucroAtivo, lucroCambioRealizado:(prev.lucroCambioRealizado||0)+lucroCambio};
         }
       }
     });
@@ -662,11 +672,13 @@ function AppInner({ onLogout }){
   }
 
   function salvarEdicao(opEditada) {
+    const ptaxEdit = opEditada.moeda==="USD" ? (parseFloat(opEditada.ptax)||usdBrl) : null;
     const novasOps = operacoes.map(o => o.id === opEditada.id ? {
       ...opEditada,
       qtd: parseFloat(opEditada.qtd),
       preco: parseFloat(opEditada.preco),
-      total: parseFloat(opEditada.qtd) * parseFloat(opEditada.preco) * (opEditada.moeda==="USD" ? usdBrl : 1),
+      total: parseFloat(opEditada.qtd) * parseFloat(opEditada.preco) * (ptaxEdit||1),
+      ptax: ptaxEdit,
     } : o);
     aplicarReconstrucao(novasOps);
     setEditOp(null);
@@ -688,7 +700,8 @@ function AppInner({ onLogout }){
     setTimeout(()=>{
       const ticker=form.ticker.toUpperCase();
       let isNew=false;
-      const novaOp={id:Date.now(),tipo:form.tipo,ticker,nome:form.nome||ticker,classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco:parseFloat(form.preco),total:parseFloat(form.qtd)*parseFloat(form.preco)*(form.moeda==="USD"?usdBrl:1),moeda:form.moeda,data:form.data};
+      const ptaxOp=form.moeda==="USD"?(parseFloat(form.ptax)||usdBrl):null;
+      const novaOp={id:Date.now(),tipo:form.tipo,ticker,nome:form.nome||ticker,classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco:parseFloat(form.preco),total:parseFloat(form.qtd)*parseFloat(form.preco)*(ptaxOp||1),moeda:form.moeda,data:form.data,ptax:ptaxOp};
       setOperacoes(p=>[novaOp,...p]);
 
       if(form.tipo==="compra"){
@@ -716,14 +729,15 @@ function AppInner({ onLogout }){
             const novoValorTotal=novosLotes.reduce((s,l)=>s+l.valor_inicial,0);
             setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:novaQtd,preco_medio:novoValorTotal/novaQtd,lotes:novosLotes}:a));
           } else {
-            // Ações/outros: preço médio ponderado normal
+            // Ações/outros: preço médio ponderado normal (e PTAX médio ponderado, se USD)
             const nq=ex.qtd+parseFloat(form.qtd);
             const nm=(ex.qtd*ex.preco_medio+parseFloat(form.qtd)*parseFloat(form.preco))/nq;
-            setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:nq,preco_medio:nm}:a));
+            const nPtax=form.moeda==="USD"?((ex.qtd*(ex.ptax_medio||usdBrl)+parseFloat(form.qtd)*ptaxOp)/nq):ex.ptax_medio;
+            setAssets(p=>p.map(a=>a.id===ex.id?{...a,qtd:nq,preco_medio:nm,ptax_medio:nPtax}:a));
           }
         } else {
           isNew=true;
-          const novoAtivo={id:Date.now()+1,ticker,nome:form.nome||ticker,classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco_medio:parseFloat(form.preco),preco_atual:parseFloat(form.preco),moeda:form.moeda,proventos:0,lucroRealizado:0,data_compra:form.data};
+          const novoAtivo={id:Date.now()+1,ticker,nome:form.nome||ticker,classe:form.classe,investidor:form.investidor,qtd:parseFloat(form.qtd),preco_medio:parseFloat(form.preco),preco_atual:parseFloat(form.preco),moeda:form.moeda,proventos:0,lucroRealizado:0,lucroAtivoRealizado:0,lucroCambioRealizado:0,ptax_medio:form.moeda==="USD"?ptaxOp:null,data_compra:form.data};
           if(isRF){
             novoAtivo.indexador=form.indexador;
             novoAtivo.taxa=parseFloat(form.taxa)||0;
@@ -735,24 +749,33 @@ function AppInner({ onLogout }){
           setAssets(p=>[...p,novoAtivo]);
         }
       } else {
-        // venda: calcula lucro realizado
+        // venda: calcula lucro realizado, decompondo entre efeito ativo (preço) e efeito câmbio (PTAX)
         setAssets(p=>p.map(a=>{
           if(a.ticker===ticker&&a.investidor===form.investidor){
             const qtdVendida=parseFloat(form.qtd);
             const precoVenda=parseFloat(form.preco);
-            const lucro=(precoVenda-a.preco_medio)*qtdVendida*(a.moeda==="USD"?usdBrl:1);
+            const isUSD=a.moeda==="USD";
+            const ptaxCompra=isUSD?(a.ptax_medio||usdBrl):1;
+            const ptaxVenda=isUSD?ptaxOp:1;
+            // Efeito ativo: variação do preço em USD, valorizada ao câmbio de compra
+            const lucroAtivo=(precoVenda-a.preco_medio)*qtdVendida*ptaxCompra;
+            // Efeito câmbio: variação do PTAX, aplicada sobre o valor de venda em USD
+            const lucroCambio=isUSD?precoVenda*qtdVendida*(ptaxVenda-ptaxCompra):0;
+            const lucro=lucroAtivo+lucroCambio;
             const lucroAcum=(a.lucroRealizado||0)+lucro;
+            const lucroAtivoAcum=(a.lucroAtivoRealizado||0)+lucroAtivo;
+            const lucroCambioAcum=(a.lucroCambioRealizado||0)+lucroCambio;
             const nq=a.qtd-qtdVendida;
             if(nq<=0){
               // ativo zerado: guarda no histórico de zerados
               setAtivosZerados(prev=>{
                 const key=`${ticker}_${form.investidor}`;
-                const prev2=prev[key]||{ticker,nome:a.nome,classe:a.classe,investidor:form.investidor,lucroRealizado:0,vendas:[]};
-                return {...prev,[key]:{...prev2,lucroRealizado:(prev2.lucroRealizado||0)+lucroAcum,preco_medio:a.preco_medio,vendas:[...(prev2.vendas||[]),{data:form.data,qtd:qtdVendida,preco:precoVenda,lucro}]}};
+                const prev2=prev[key]||{ticker,nome:a.nome,classe:a.classe,investidor:form.investidor,lucroRealizado:0,lucroAtivoRealizado:0,lucroCambioRealizado:0,vendas:[]};
+                return {...prev,[key]:{...prev2,lucroRealizado:(prev2.lucroRealizado||0)+lucroAcum,lucroAtivoRealizado:(prev2.lucroAtivoRealizado||0)+lucroAtivoAcum,lucroCambioRealizado:(prev2.lucroCambioRealizado||0)+lucroCambioAcum,preco_medio:a.preco_medio,ptax_medio:a.ptax_medio,vendas:[...(prev2.vendas||[]),{data:form.data,qtd:qtdVendida,preco:precoVenda,ptax:ptaxOp,lucro,lucroAtivo,lucroCambio}]}};
               });
               return null;
             }
-            return {...a,qtd:nq,lucroRealizado:lucroAcum};
+            return {...a,qtd:nq,lucroRealizado:lucroAcum,lucroAtivoRealizado:lucroAtivoAcum,lucroCambioRealizado:lucroCambioAcum};
           }
           return a;
         }).filter(Boolean));
@@ -1071,7 +1094,7 @@ function AppInner({ onLogout }){
                                 const rent=toRent(a,usdBrl,indicadores,fatoresAcum);
                                 const valorTotal=toVal(a,usdBrl,indicadores,fatoresAcum);
                                 const valorAplicado=toCusto(a,usdBrl);
-                                const valorAtual=valorTotal/(a.qtd||1);
+                                const valorAtual=a.preco_atual;
                                 const lucro=a.lucroRealizado||0;
                                 const isRF=isRendaFixa(a)&&a.indexador;
                                 const temLotes=isRF&&a.lotes&&a.lotes.length>1;
@@ -1091,7 +1114,10 @@ function AppInner({ onLogout }){
                                       {isRF&&!temLotes&&(a.indexador==="cdi"?(a.modo_cdi==="percentual"?`${a.taxa}% CDI`:`CDI+${a.taxa}%`):a.indexador==="pre"?`Pré ${a.taxa}%`:`${a.indexador.toUpperCase()}+${a.taxa}%`)}
                                     </td>
                                     <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{fmt(a.qtd,a.qtd<1?6:2)}</td>
-                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>{isRF&&temLotes?"—":a.moeda==="USD"?fmtUSD(a.preco_medio):fmtBRL(a.preco_medio)}</td>
+                                    <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.6)"}}>
+                                      {isRF&&temLotes?"—":a.moeda==="USD"?fmtUSD(a.preco_medio):fmtBRL(a.preco_medio)}
+                                      {a.moeda==="USD"&&a.ptax_medio&&<div style={{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:1}}>PTAX méd: {fmt(a.ptax_medio,4)}</div>}
+                                    </td>
                                     <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.75)",fontWeight:500}}>{fmtBRL(valorAplicado)}</td>
                                     <td style={{padding:"8px 10px",color:"#fff",fontWeight:500}}>{isRF&&temLotes?"—":a.moeda==="USD"?fmtUSD(valorAtual):fmtBRL(valorAtual)}</td>
                                     <td style={{padding:"8px 10px",color:a.variacao_dia>=0?"#86efac":"#fca5a5",fontSize:11}}>{a.variacao_dia!=null&&!isRF?fmtPct(a.variacao_dia):"—"}</td>
@@ -1157,6 +1183,8 @@ function AppInner({ onLogout }){
                   <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:10,marginBottom:"1rem"}}>
                     {[
                       {l:"Lucro total realizado",v:fmtBRL(zerados.reduce((s,z)=>s+z.lucroRealizado,0)),pos:zerados.reduce((s,z)=>s+z.lucroRealizado,0)>=0},
+                      {l:"— do ativo (USD)",v:fmtBRL(zerados.reduce((s,z)=>s+(z.lucroAtivoRealizado||0),0)),pos:zerados.reduce((s,z)=>s+(z.lucroAtivoRealizado||0),0)>=0},
+                      {l:"— do câmbio (PTAX)",v:fmtBRL(zerados.reduce((s,z)=>s+(z.lucroCambioRealizado||0),0)),pos:zerados.reduce((s,z)=>s+(z.lucroCambioRealizado||0),0)>=0},
                       {l:"Posições encerradas",v:zerados.length},
                     ].map(x=>(
                       <div key={x.l} style={card}>
@@ -1167,10 +1195,11 @@ function AppInner({ onLogout }){
                   </div>
                   <div style={{overflowX:"auto",borderRadius:12,border:"1px solid rgba(255,255,255,0.1)"}}>
                     <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-                      <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Ticker","Investidor","Classe","P. Médio","Última Venda","Qtd Vendida","Lucro Realizado"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
+                      <thead><tr style={{background:"rgba(255,255,255,0.06)"}}>{["Ticker","Investidor","Classe","P. Médio","Última Venda","Qtd Vendida","Lucro (Ativo)","Lucro (Câmbio)","Lucro Realizado"].map(h=>(<th key={h} style={{padding:"8px 10px",textAlign:"left",color:"rgba(255,255,255,0.5)",fontWeight:500,whiteSpace:"nowrap"}}>{h}</th>))}</tr></thead>
                       <tbody>
                         {zerados.map((z,i)=>{
                           const ult=z.vendas?.[z.vendas.length-1];
+                          const isUSD=z.ptax_medio!=null;
                           return(
                             <tr key={i} style={{borderTop:"1px solid rgba(255,255,255,0.06)",background:i%2===0?"rgba(255,255,255,0.02)":"transparent"}}>
                               <td style={{padding:"8px 10px",fontWeight:500,color:"#fff"}}>{z.ticker}</td>
@@ -1179,6 +1208,8 @@ function AppInner({ onLogout }){
                               <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{z.preco_medio?fmtBRL(z.preco_medio):"—"}</td>
                               <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.7)"}}>{ult?`${fmtBRL(ult.preco)} em ${ult.data}`:"—"}</td>
                               <td style={{padding:"8px 10px",color:"rgba(255,255,255,0.8)"}}>{ult?fmt(ult.qtd,ult.qtd<1?6:2):"—"}</td>
+                              <td style={{padding:"8px 10px",color:(z.lucroAtivoRealizado||0)>=0?"#86efac":"#fca5a5"}}>{isUSD?fmtBRL(z.lucroAtivoRealizado||0):"—"}</td>
+                              <td style={{padding:"8px 10px",color:(z.lucroCambioRealizado||0)>=0?"#86efac":"#fca5a5"}}>{isUSD?fmtBRL(z.lucroCambioRealizado||0):"—"}</td>
                               <td style={{padding:"8px 10px",fontWeight:500,color:z.lucroRealizado>=0?"#86efac":"#fca5a5"}}>{fmtBRL(z.lucroRealizado)}</td>
                             </tr>
                           );
@@ -1213,9 +1244,15 @@ function AppInner({ onLogout }){
                     {l:"Quantidade",e:<input type="number" value={form.qtd} onChange={e=>setForm(f=>({...f,qtd:e.target.value}))} placeholder="0"/>},
                     {l:"Preço unit.",e:<input type="number" value={form.preco} onChange={e=>setForm(f=>({...f,preco:e.target.value}))} placeholder="0,00"/>},
                     {l:"Data",e:<input type="date" value={form.data} onChange={e=>setForm(f=>({...f,data:e.target.value}))}/>},
-                    {l:"Total est.",e:<div style={{padding:"7px 10px",borderRadius:8,background:"rgba(255,255,255,0.06)",color:form.qtd&&form.preco?"#86efac":"rgba(255,255,255,0.3)",fontWeight:500,fontSize:13}}>{form.qtd&&form.preco?fmtBRL(parseFloat(form.qtd)*parseFloat(form.preco)*(form.moeda==="USD"?usdBrl:1)):"—"}</div>},
+                    ...(form.moeda==="USD"?[{l:form.tipo==="compra"?"PTAX (compra)":"PTAX (venda)",e:<input type="number" step="0.0001" value={form.ptax} onChange={e=>setForm(f=>({...f,ptax:e.target.value}))} placeholder={`ex: ${fmt(usdBrl,4)}`}/>}]:[]),
+                    {l:"Total est.",e:<div style={{padding:"7px 10px",borderRadius:8,background:"rgba(255,255,255,0.06)",color:form.qtd&&form.preco?"#86efac":"rgba(255,255,255,0.3)",fontWeight:500,fontSize:13}}>{form.qtd&&form.preco?fmtBRL(parseFloat(form.qtd)*parseFloat(form.preco)*(form.moeda==="USD"?(parseFloat(form.ptax)||usdBrl):1)):"—"}</div>},
                   ].map(({l,e})=>(<div key={l}><label style={{fontSize:12,color:"rgba(255,255,255,0.6)",display:"block",marginBottom:4}}>{l}</label>{e}</div>))}
                 </div>
+                {form.moeda==="USD"&&(
+                  <p style={{fontSize:11,color:"rgba(255,255,255,0.4)",margin:"10px 0 0",lineHeight:1.4}}>
+                    <i className="ti ti-info-circle" style={{fontSize:11,marginRight:3}}/>Informe o PTAX (câmbio) do dia da operação. Se deixado em branco, será usado o câmbio atual (R$ {fmt(usdBrl,4)}) — o que pode distorcer a decomposição entre ganho do ativo e ganho cambial.
+                  </p>
+                )}
 
                 {/* Campos específicos para Renda Fixa */}
                 {["Tesouro Direto","CDB/LCI/LCA"].includes(form.classe)&&form.tipo==="compra"&&(
@@ -1371,6 +1408,7 @@ function AppInner({ onLogout }){
                       {l:"Preço unit.",e:<input type="number" value={editOp.preco} onChange={e=>setEditOp({...editOp,preco:e.target.value})}/>},
                       {l:"Data",e:<input type="date" value={editOp.data} onChange={e=>setEditOp({...editOp,data:e.target.value})}/>},
                       {l:"Moeda",e:<select value={editOp.moeda} onChange={e=>setEditOp({...editOp,moeda:e.target.value})}><option value="BRL">BRL (R$)</option><option value="USD">USD (US$)</option></select>},
+                      ...(editOp.moeda==="USD"?[{l:editOp.tipo==="compra"?"PTAX (compra)":"PTAX (venda)",e:<input type="number" step="0.0001" value={editOp.ptax||""} onChange={e=>setEditOp({...editOp,ptax:e.target.value})}/>}]:[]),
                     ].map(({l,e})=>(<div key={l}><label style={{fontSize:12,color:"rgba(255,255,255,0.6)",display:"block",marginBottom:4}}>{l}</label>{e}</div>))}
                   </div>
                   <div style={{display:"flex",gap:8,marginTop:18}}>
