@@ -271,7 +271,8 @@ function AppInner({ onLogout }){
   const [migracaoMsg,setMigracaoMsg]=useState(""); // { [ativo_id]: { ipca, cdi } } // "Vitor" | "Larissa" | null
   const [tab,setTab]=useState("dashboard");
   const [investor,setInvestor]=useState("Todos");
-  const [usdBrl,setUsdBrl]=useState(5.25);
+  const [usdBrl,setUsdBrl]=useState(saved?.usdBrl||5.25); // 5,25 só como último recurso; o valor real vem do backend/último salvo
+  const [cambioInfo,setCambioInfo]=useState(null); // { fonte, atualizado, stale }
   const [indicadores,setIndicadores]=useState(null);
   const [apiStatus,setApiStatus]=useState({cotacoes:"idle",cambio:"idle",indicadores:"idle"});
   const [lastUpdate,setLastUpdate]=useState(null);
@@ -348,6 +349,7 @@ function AppInner({ onLogout }){
           if(dados.goalsTotal) setGoalsTotal(dados.goalsTotal);
           if(dados.goalsClass) setGoalsClass(dados.goalsClass);
           setFatoresAcum(dados.fatoresAcum&&typeof dados.fatoresAcum==="object"?dados.fatoresAcum:{});
+          if(dados.usdBrl>2) setUsdBrl(u=>u===5.25?dados.usdBrl:u); // só usa o salvo se ainda não chegou cotação nova
         }
       }catch(e){
         console.error("Erro na carga inicial:",e);
@@ -412,11 +414,11 @@ function AppInner({ onLogout }){
     if(saveTimeout.current) clearTimeout(saveTimeout.current);
     saveTimeout.current=setTimeout(async()=>{
       setSalvandoBackend(true);
-      await salvarDadosBackend({assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum});
+      await salvarDadosBackend({assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum,usdBrl});
       setSalvandoBackend(false);
     },1500);
     return ()=>{ if(saveTimeout.current) clearTimeout(saveTimeout.current); };
-  },[assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum,carregando]);
+  },[assets,provs,operacoes,snapshots,ativosZerados,goalsTotal,goalsClass,fatoresAcum,usdBrl,carregando]);
 
   // ── Snapshot mensal dinâmico: atualiza o mês vigente sempre que ativos ou câmbio mudam ──
   // Snapshots de meses anteriores ficam imutáveis (criados quando o mês fecha ou via carga histórica)
@@ -525,7 +527,20 @@ function AppInner({ onLogout }){
     const authFail = () => onLogout();
     setApiStatus({cotacoes:"loading",cambio:"loading",indicadores:"loading"});
     log("Iniciando atualização...");
-    try{const r=await apiFetch(`${API}/api/cambio`,{},authFail);const d=await r.json();if(d.usd_brl){setUsdBrl(d.usd_brl);log(`Câmbio: R$ ${d.usd_brl.toFixed(4)} (${d.fonte})`,"ok");}else{log("Câmbio: sem dado, mantendo último valor","warn");}setApiStatus(s=>({...s,cambio:"ok"}));}catch(e){log("Câmbio: erro","error");setApiStatus(s=>({...s,cambio:"error"}));}
+    try{
+      const r=await apiFetch(`${API}/api/cambio?t=${Date.now()}`,{cache:"no-store"},authFail);
+      const d=await r.json();
+      if(r.ok&&d.usd_brl>2){
+        setUsdBrl(d.usd_brl);
+        setCambioInfo({fonte:d.fonte,atualizado:d.atualizado,stale:!!d.stale});
+        log(`Câmbio: R$ ${d.usd_brl.toFixed(4)} (${d.fonte}${d.cache?", cache 1 min":""})`,d.stale?"warn":"ok");
+        if(d.stale)log("Câmbio: todas as fontes falharam, usando última cotação válida do servidor","warn");
+        setApiStatus(s=>({...s,cambio:d.stale?"warn":"ok"}));
+      }else{
+        log(`Câmbio: ${d.error||"sem dado"} — mantendo último valor`,"warn");
+        setApiStatus(s=>({...s,cambio:"error"}));
+      }
+    }catch(e){log(`Câmbio: erro (${e.message})`,"error");setApiStatus(s=>({...s,cambio:"error"}));}
     try{const r=await apiFetch(`${API}/api/indicadores`,{},authFail);const d=await r.json();setIndicadores(d);log(`CDI ${d.cdi_anual}% · Selic ${d.selic}% · IPCA ${d.ipca_mensal}%/mês`,"ok");setApiStatus(s=>({...s,indicadores:"ok"}));}catch(e){log("Indicadores: erro","error");setApiStatus(s=>({...s,indicadores:"error"}));}
 
     // ── Busca fatores IPCA/CDI acumulados para cada ativo de renda fixa ──
@@ -621,7 +636,30 @@ function AppInner({ onLogout }){
         }
       }catch(e){log("EUA: erro","error");}
     }
-    try{const r=await apiFetch(`${API}/api/cotacoes/crypto`,{},authFail);const d=await r.json();if(d.bitcoin){setAssets(p=>p.map(a=>a.ticker==="BTC"?{...a,preco_atual:d.bitcoin.preco_brl,variacao_dia:d.bitcoin.variacao_24h}:a));log(`Bitcoin: R$ ${d.bitcoin.preco_brl.toLocaleString("pt-BR")}`,"ok");}}catch(e){log("Bitcoin: erro","error");}
+    // Bitcoin: identifica o ativo pela classe "Bitcoin" ou por tickers comuns (BTC, BTC-BRL, BTC-USD, BITCOIN)
+    const isBTC=a=>{const t=(a.ticker||"").trim().toUpperCase();return ["BTC","BTC-BRL","BTC-USD","BTCBRL","BTCUSD","BITCOIN","XBT"].includes(t);};
+    const btcAtivos=cur.filter(isBTC);
+    const btcSemMatch=cur.filter(a=>a.classe==="Bitcoin"&&!isBTC(a));
+    if(btcSemMatch.length>0)log(`Bitcoin: ticker(s) ${[...new Set(btcSemMatch.map(a=>a.ticker))].join(", ")} na classe Bitcoin não reconhecido(s) como BTC à vista — não atualizados`,"warn");
+    if(btcAtivos.length>0){
+      try{
+        const r=await apiFetch(`${API}/api/cotacoes/crypto?t=${Date.now()}`,{cache:"no-store"},authFail);
+        const d=await r.json();
+        const b=d.bitcoin;
+        if(r.ok&&b&&b.preco_brl>0){
+          setAssets(p=>p.map(a=>{
+            if(!isBTC(a))return a;
+            // Respeita a moeda do ativo: se cadastrado em USD, usa o preço em USD (toVal converte pelo câmbio)
+            const preco=a.moeda==="USD"?(b.preco_usd||a.preco_atual):b.preco_brl;
+            return {...a,preco_atual:preco,variacao_dia:b.variacao_24h??a.variacao_dia};
+          }));
+          log(`Bitcoin: R$ ${b.preco_brl.toLocaleString("pt-BR",{maximumFractionDigits:0})} (${d.fonte}${d.cache?", cache 1 min":""})`,d.stale?"warn":"ok");
+          if(d.stale)log("Bitcoin: todas as fontes falharam, usando última cotação válida do servidor","warn");
+        }else{
+          log(`Bitcoin: ${d.error||"sem dado"} — preço mantido`,"error");
+        }
+      }catch(e){log(`Bitcoin: erro (${e.message})`,"error");}
+    }
     setApiStatus(s=>({...s,cotacoes:"ok"}));
     const now=new Date().toLocaleString("pt-BR");setLastUpdate(now);log(`Concluído — ${now}`,"ok");
   },[]);
@@ -964,7 +1002,7 @@ function AppInner({ onLogout }){
           <div>
             <p style={{fontWeight:500,fontSize:17,margin:0,color:"#fff"}}>Investimentos Familiares</p>
             <div style={{display:"flex",gap:8,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>
-              <span style={{fontSize:11,color:"rgba(255,255,255,0.5)"}}>USD/BRL {fmt(usdBrl,4)}</span>
+              <span title={cambioInfo?`Fonte: ${cambioInfo.fonte} · ${new Date(cambioInfo.atualizado).toLocaleString("pt-BR")}`:"Câmbio ainda não atualizado nesta sessão"} style={{fontSize:11,color:cambioInfo?.stale||!cambioInfo?"rgba(251,191,36,0.8)":"rgba(255,255,255,0.5)"}}>USD/BRL {fmt(usdBrl,4)}{cambioInfo?.stale?" ⚠":""}</span>
               {indicadores&&<span style={{fontSize:11,color:"rgba(255,255,255,0.5)"}}>· CDI {indicadores.cdi_anual}% · Selic {indicadores.selic}%</span>}
               {lastUpdate&&<span style={{fontSize:11,color:"rgba(255,255,255,0.35)"}}>· {lastUpdate}</span>}
             </div>
