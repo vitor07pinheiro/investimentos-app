@@ -522,11 +522,18 @@ function AppInner({ onLogout }){
 
   const log=(msg,type="info")=>setApiLog(p=>[{msg,type,ts:new Date().toLocaleTimeString("pt-BR")},...p].slice(0,15));
 
+  const atualizandoRef=useRef(false);
   const atualizarTudo=useCallback(async()=>{
+    // Evita duas atualizações ao mesmo tempo (ex.: carga inicial + clique no botão), que duplicavam chamadas à BRAPI
+    if(atualizandoRef.current){log("Atualização já em andamento — aguarde","warn");return;}
+    atualizandoRef.current=true;
+    try{
     const cur=assetsRef.current;
     const authFail = () => onLogout();
     setApiStatus({cotacoes:"loading",cambio:"loading",indicadores:"loading"});
     log("Iniciando atualização...");
+    // Confere a versão do backend publicada (ajuda a detectar deploy que não subiu)
+    try{const r=await fetch(`${API}/`,{cache:"no-store"});const d=await r.json();log(`Backend versão ${d.versao} · banco ${d.db}`,d.versao>="4.2.0"?"ok":"warn");}catch(e){log("Backend: não respondeu ao health check","error");}
     try{
       const r=await apiFetch(`${API}/api/cambio?t=${Date.now()}`,{cache:"no-store"},authFail);
       const d=await r.json();
@@ -579,20 +586,34 @@ function AppInner({ onLogout }){
           log(`B3: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
           if(d.nao_encontrados?.length>0)
             log(`B3: tickers não encontrados na BRAPI: ${d.nao_encontrados.join(", ")}`, "warn");
+          if(d.motivos?.length>0) log(`B3: motivo informado pela BRAPI → ${d.motivos.join(" | ")}`, "error");
+          if(d.do_cache>0) log(`B3: ${d.do_cache} cotação(ões) reaproveitada(s) do cache de 5 min (BRAPI gratuita tem ~30 min de atraso)`,"info");
         }
       }catch(e){log("B3: erro","error");}
     }
 
     // Proventos B3 (conecta rota já existente no backend: /api/proventos/:ticker)
-    if(b3.length>0){
+    // Proventos consomem 1 requisição BRAPI por ticker e o plano gratuito não inclui esse módulo:
+    // busca no máximo 1x por dia e em sequência; se o plano não cobrir, pausa por 7 dias.
+    const PROV_KEY="inv_prov_ultima_busca";
+    let provInfo={};try{provInfo=JSON.parse(localStorage.getItem(PROV_KEY)||"{}");}catch(e){}
+    const agoraMs=Date.now();
+    const provLiberado=!provInfo.proxima||agoraMs>=provInfo.proxima;
+    if(b3.length>0&&!provLiberado){
+      log(`Proventos BRAPI: próxima busca automática em ${new Date(provInfo.proxima).toLocaleString("pt-BR")}${provInfo.semAcesso?" (plano BRAPI sem módulo de dividendos)":""}`,"info");
+    }
+    if(b3.length>0&&provLiberado){
       try{
         const tickersUnicos=[...new Set(b3.map(a=>a.ticker))];
         const novosProventos=[];
-        await Promise.all(tickersUnicos.map(async ticker=>{
+        let semAcesso=0,falhas=0;
+        for(const ticker of tickersUnicos){
           try{
             const r=await apiFetch(`${API}/api/proventos/${ticker}`,{},authFail);
             const d=await r.json();
-            if(!d.proventos)return;
+            if(!r.ok){falhas++;continue;}
+            if(d.sem_acesso){semAcesso++;if(semAcesso>=2&&novosProventos.length===0)break;continue;}
+            if(!d.proventos)continue;
             d.proventos.forEach(p=>{
               if(!p.data_pagamento||!p.valor)return;
               // Para cada investidor que possui esse ticker, lança o provento (se ainda não importado)
@@ -605,8 +626,12 @@ function AppInner({ onLogout }){
                 novosProventos.push({id:Date.now()+Math.random(),ticker,investidor:a.investidor,tipo:isJCP?"JCP":"Dividendo",valor:valorTotal,moeda:"BRL",data:p.data_pagamento,origem:"brapi"});
               });
             });
-          }catch(e){/* ignora erro individual de ticker */}
-        }));
+          }catch(e){falhas++;}
+        }
+        const planoSemDividendos=semAcesso>=2&&novosProventos.length===0;
+        try{localStorage.setItem(PROV_KEY,JSON.stringify({ultima:agoraMs,proxima:agoraMs+(planoSemDividendos?7:1)*86400000,semAcesso:planoSemDividendos}));}catch(e){}
+        if(planoSemDividendos)log("Proventos BRAPI: seu plano não inclui dados de dividendos — lance proventos manualmente (nova tentativa em 7 dias)","warn");
+        else if(falhas>0)log(`Proventos BRAPI: ${falhas} ticker(s) com erro nesta busca`,"warn");
         if(novosProventos.length>0){
           setProvs(p=>[...novosProventos,...p]);
           setAssets(prev=>prev.map(a=>{
@@ -633,6 +658,7 @@ function AppInner({ onLogout }){
           log(`EUA: ${d.cotacoes.length} ativo(s) atualizado(s)`,"ok");
           if(d.nao_encontrados?.length>0)
             log(`EUA: tickers não encontrados: ${d.nao_encontrados.join(", ")}`, "warn");
+          if(d.motivos?.length>0) log(`EUA: motivo informado pela BRAPI → ${d.motivos.join(" | ")}`, "error");
         }
       }catch(e){log("EUA: erro","error");}
     }
@@ -662,6 +688,7 @@ function AppInner({ onLogout }){
     }
     setApiStatus(s=>({...s,cotacoes:"ok"}));
     const now=new Date().toLocaleString("pt-BR");setLastUpdate(now);log(`Concluído — ${now}`,"ok");
+    }finally{atualizandoRef.current=false;}
   },[]);
 
   useEffect(()=>{atualizarTudo();},[]);
